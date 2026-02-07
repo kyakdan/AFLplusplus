@@ -138,11 +138,14 @@ struct afl_base_pass : gimple_opt_pass {
     };
 
     const char *name = IDENTIFIER_POINTER(DECL_NAME(F->decl));
-    int         len = IDENTIFIER_LENGTH(DECL_NAME(F->decl));
 
     for (auto const &ignoreListFunc : ignoreList) {
 
-      if (strncmp(name, ignoreListFunc, len) == 0) { return true; }
+      if (strncmp(name, ignoreListFunc, strlen(ignoreListFunc)) == 0) {
+
+        return true;
+
+      }
 
     }
 
@@ -516,4 +519,3 @@ struct afl_base_pass : gimple_opt_pass {
 #else
   #define gimple gimple
 #endif
-
