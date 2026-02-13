@@ -1495,11 +1495,16 @@ void __afl_manual_init(void) {
 
   }
 
-  if (getenv("AFL_LLVM_ONLY_FSRV") || getenv("AFL_GCC_ONLY_FRSV")) {
+  if (getenv("AFL_LLVM_ONLY_FSRV") || getenv("AFL_GCC_ONLY_FSRV") ||
+      getenv("AFL_GCC_ONLY_FRSV")) {
 
-    fprintf(stderr,
-            "DEBUG: Overwrite area_ptr to dummy due to "
-            "AFL_LLVM_ONLY_FSRV/AFL_GCC_ONLY_FRSV\n");
+    if (__afl_debug) {
+
+      fprintf(stderr,
+              "DEBUG: Overwrite area_ptr to dummy due to "
+              "AFL_LLVM_ONLY_FSRV/AFL_GCC_ONLY_FSRV\n");
+
+    }
     __afl_area_ptr = __afl_area_ptr_dummy;
 
   }
@@ -1624,8 +1629,10 @@ __attribute__((constructor(0))) void __afl_auto_first(void) {
 */
 
 /* The following stuff deals with supporting -fsanitize-coverage=trace-pc-guard.
-   It remains non-operational in the traditional, plugin-backed LLVM mode.
-   For more info about 'trace-pc-guard', see README.llvm.md.
+   Used by LLVM PCGUARD mode and GCC plugin PC Guard mode.
+   The callback (__sanitizer_cov_trace_pc_guard) is used by LLVM; the GCC plugin
+   uses inline instrumentation but calls __sanitizer_cov_trace_pc_guard_init
+   for guard ID assignment.  For more info, see README.llvm.md.
 
    The first function (__sanitizer_cov_trace_pc_guard) is called back on every
    edge (as opposed to every basic block). */
@@ -3671,4 +3678,3 @@ uint32_t ijon_memdist(char *a, char *b, size_t len) {
   }
 
 }
-
