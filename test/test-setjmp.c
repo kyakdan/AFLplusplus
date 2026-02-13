@@ -17,7 +17,7 @@ jmp_buf    env;
 sigjmp_buf sigenv;
 int        counter = 0;
 
-void bar(void) {
+void __attribute__((noinline)) bar(void) {
 
 }
 

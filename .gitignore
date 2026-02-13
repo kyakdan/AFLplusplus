@@ -143,6 +143,12 @@ test.out
 test/test-custom-mutator
 test/test-ijon-legacy
 test/test-ijon-pcguard
+test/test-critical-edges
 test/test-instr.plain.mycheck
+test/test-pcguard-persistent
+test/test-pcguard-dso-main
+test/libtest-pcguard-dso.so
+test/test-pcguard-nosanitize
+test/test-pcguard-nosanitize.log
+test/test-pcguard-nosanitize-test-pcguard-nosanitize.c.*.afl
 test/test-multiple-mutators
-
