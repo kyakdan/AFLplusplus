@@ -1,23 +1,16 @@
-/* GCC plugin for instrumentation of code for american fuzzy lop.
+/* GCC plugin for PC Guard edge coverage instrumentation for AFL++.
 
    Copyright 2014-2019 Free Software Foundation, Inc
    Copyright 2015, 2016 Google Inc. All rights reserved.
    Copyright 2019-2024 AdaCore
 
-   Written by Alexandre Oliva <oliva@adacore.com>, based on the AFL
+   Originally written by Alexandre Oliva <oliva@adacore.com>, based on the AFL
    LLVM pass by Laszlo Szekeres <lszekeres@google.com> and Michal
-   Zalewski <lcamtuf@google.com>, and copying a little boilerplate
-   from GCC's libcc1 plugin and GCC proper.  Aside from the
-   boilerplate, namely includes and the pass data structure, and pass
-   initialization code and output messages borrowed and adapted from
-   the LLVM pass into plugin_init and plugin_finalize, the
-   implementation of the GCC pass proper is written from scratch,
-   aiming at similar behavior and performance to that of the LLVM
-   pass, and also at compatibility with the out-of-line
-   instrumentation and run times of AFL++, as well as of an earlier
-   GCC plugin implementation by Austin Seipp <aseipp@pobox.com>.  The
-   implementation of Allow/Deny Lists is adapted from that in the LLVM
-   plugin.
+   Zalewski <lcamtuf@google.com>.
+
+   Rewritten to use PC Guard mechanism (like LLVM's SanitizerCoveragePCGUARD)
+   for collision-free edge coverage with true edge instrumentation via
+   critical edge splitting.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -34,100 +27,32 @@
 
  */
 
-/* This file implements a GCC plugin that introduces an
-   instrumentation pass for AFL.  What follows is the specification
-   used to rewrite it, extracted from the functional llvm_mode pass
-   and from an implementation of the gcc_plugin started by Austin
-   Seipp <aseipp@pobox.com>.
+/* This GCC plugin implements PC Guard edge coverage instrumentation.
 
-   Declare itself as GPL-compatible.
+   The approach mirrors LLVM's SanitizerCoveragePCGUARD:
 
-   Define a 'plugin_init' function.
+   1. Split all critical edges to enable true edge coverage
+   2. Use dominator-based pruning to skip redundant blocks
+   3. Create per-function guard arrays in __sancov_guards section
+   4. Emit a per-TU constructor that passes linker-provided guard bounds
+      to __sanitizer_cov_trace_pc_guard_init
+   5. At runtime, the init function assigns globally unique IDs to guards
+   6. Each instrumented block loads its guard value and uses it as map index
 
-   Check version against the global gcc_version.
+   The AFL++ runtime (afl-compiler-rt.o.c) receives guard ranges from those
+   constructors and performs the ID assignment in a platform-independent way.
 
-   Register a PLUGIN_INFO object with .version and .help.
-
-   Initialize the random number generator seed with GCC's
-   random seed.
-
-   Set quiet mode depending on whether stderr is a terminal and
-   AFL_QUIET is set.
-
-   Output some identification message if not in quiet mode.
-
-   Parse AFL_INST_RATIO, if set, as a number between 0 and 100.  Error
-   out if it's not in range; set up an instrumentation ratio global
-   otherwise.
-
-   Introduce a single instrumentation pass after SSA.
-
-   The new pass is to be a GIMPLE_PASS.  Given the sort of
-   instrumentation it's supposed to do, its todo_flags_finish will
-   certainly need TODO_update_ssa, and TODO_cleanup_cfg.
-   TODO_rebuild_cgraph_edges is required only in the out-of-line
-   instrumentation mode.
-
-   The instrumentation pass amounts to iterating over all basic blocks
-   and optionally inserting one of the instrumentation sequences below
-   after its labels, to indicate execution entered the block.
-
-   A block should be skipped if AFL_R(100) (from ../types.h) is >= the
-   global instrumentation ratio.
-
-   A block may be skipped for other reasons, such as if all of its
-   predecessors have a single successor.
-
-   For an instrumented block, a AFL_R(MAP_SIZE) say <N> should be
-   generated to be used as its location number.  Let <C> be a compiler
-   constant built out of it.
-
-   Count instrumented blocks and print a message at the end of the
-   compilation, if not in quiet mode.
-
-   Instrumentation in "dumb" or "out-of-line" mode requires calling a
-   function, passing it the location number.  The function to be
-   called is __afl_trace, implemented in afl-gcc-rt.o.c.  Its
-   declaration <T> needs only be created once.
-
-   Build the call statement <T> (<C>), then add it to the seq to be
-   inserted.
-
-   Instrumentation in "fast" or "inline" mode performs the computation
-   of __afl_trace as part of the function.
-
-   It needs to read and write __afl_prev_loc, a TLS u32 variable.  Its
-   declaration <P> needs only be created once.
-
-   It needs to read and dereference __afl_area_ptr, a pointer to (an
-   array of) char.  Its declaration <M> needs only be created once.
-
-   The instrumentation sequence should then be filled with the
-   following statements:
-
-   Load from <P> to a temporary (<TP>) of the same type.
-
-   Compute <TP> ^ <C> in sizetype, converting types as needed.
-
-   Pointer-add <B> (to be introduced at a later point) and <I> into
-   another temporary <A>.
-
-   Increment the <*A> MEM_REF.
-
-   Store <C> >> 1 in <P>.
-
-   Temporaries used above need only be created once per function.
-
-   If any block was instrumented in a function, an initializer for <B>
-   needs to be introduced, loading it from <M> and inserting it in the
-   entry edge for the entry block.
+   Benefits over the previous XOR-based approach:
+   - Collision-free: unique IDs assigned at runtime across all modules
+   - True edge coverage: critical edge splitting instruments actual edges
+   - Compatible with existing AFL++ runtime infrastructure
 */
 
 #include "afl-gcc-common.h"
+
 #if defined(__has_include) && __has_include("memmodel.h")
   #include "memmodel.h"
 #endif
-#include <dominance.h>
 
 /* This plugin, being under the same license as GCC, satisfies the
    "GPL-compatible Software" definition in the GCC RUNTIME LIBRARY
@@ -136,6 +61,67 @@
 int plugin_is_GPL_compatible = 1;
 
 namespace {
+
+/* Identify compiler-generated static ctor/dtor wrappers robustly across
+   GCC versions. Older plugin headers may miss DECL_STATIC_* macros, so
+   we fall back to GCC-generated wrapper naming conventions. */
+static inline bool is_artificial_static_ctor_dtor(const_tree decl) {
+
+  if (!decl || !DECL_ARTIFICIAL(decl)) return false;
+
+#ifdef DECL_STATIC_CONSTRUCTOR
+  if (DECL_STATIC_CONSTRUCTOR(decl)) return true;
+#endif
+#ifdef DECL_STATIC_DESTRUCTOR
+  if (DECL_STATIC_DESTRUCTOR(decl)) return true;
+#endif
+
+  const_tree ident = DECL_NAME(decl);
+  if (!ident) return false;
+
+  const char *name = IDENTIFIER_POINTER(ident);
+  if (!name) return false;
+
+  /* Common GCC-generated init/fini wrapper names:
+     - prefixes "_sub_I_" / "_sub_D_" (cgraph_build_static_cdtor wrappers)
+     - prefixes "_GLOBAL__sub_I_" / "_GLOBAL__sub_D_" (C++ wrappers)
+     - "__static_initialization_and_destruction_" helpers */
+  return !strncmp(name, "_sub_I_", 7) || !strncmp(name, "_sub_D_", 7) ||
+         !strncmp(name, "_GLOBAL__sub_I_", 15) ||
+         !strncmp(name, "_GLOBAL__sub_D_", 15) ||
+         !strncmp(name, "__static_initialization_and_destruction_", 41);
+
+}
+
+/* Section name for guard arrays - depends on target object format.
+   The plugin emits a per-TU constructor (emit_pcguard_ctor) that calls
+   __sanitizer_cov_trace_pc_guard_init with linker-generated section
+   bounds, so the runtime assigns unique IDs to every guard at startup.
+
+   ELF (Linux, BSD): section "__sancov_guards"
+     -> linker creates __start___sancov_guards / __stop___sancov_guards
+
+   Mach-O (macOS): section "__DATA,__sancov_guards"
+     -> linker creates section$start$__DATA$__sancov_guards /
+                       section$end$__DATA$__sancov_guards
+
+   We use OBJECT_FORMAT_MACHO (defined by GCC based on target) rather than
+   __APPLE__ (host platform) to correctly handle cross-compilation.
+*/
+static const char *getSanCovSectionName() {
+#if defined(OBJECT_FORMAT_MACHO)
+  return "__DATA,__sancov_guards";
+#else
+  return "__sancov_guards";
+#endif
+}
+
+/* Unique counter for guard array names to avoid conflicts.  */
+static unsigned int sancov_id_counter = 0;
+
+/* Track whether this TU created any guard arrays (used for ctor emission).  */
+static bool sancov_guards_emitted = false;
+static bool sancov_ctor_emitted = false;
 
 static constexpr struct pass_data afl_pass_data = {
 
@@ -153,323 +139,297 @@ static constexpr struct pass_data afl_pass_data = {
 
 struct afl_pass : afl_base_pass {
 
-  afl_pass(bool quiet, unsigned int ratio)
+  afl_pass(bool quiet)
       : afl_base_pass(quiet, !!getenv("AFL_DEBUG"), afl_pass_data),
-        inst_ratio(ratio),
-#ifdef AFL_GCC_OUT_OF_LINE
-        out_of_line(!!(AFL_GCC_OUT_OF_LINE)),
-#else
-        out_of_line(getenv("AFL_GCC_OUT_OF_LINE")),
-#endif
-        neverZero(!getenv("AFL_GCC_SKIP_NEVERZERO")),
-        inst_blocks(0) {
+        neverZero(!getenv("AFL_GCC_SKIP_NEVERZERO")), inst_blocks(0) {
 
-    initInstrumentList();
+    /* Note: initInstrumentList() is called by afl_base_pass constructor */
 
   }
-
-  /* How likely (%) is a block to be instrumented?  */
-  const unsigned int inst_ratio;
-
-  /* Should we use slow, out-of-line call-based instrumentation?  */
-  const bool out_of_line;
 
   /* Should we make sure the map edge-crossing counters never wrap
      around to zero?  */
   const bool neverZero;
 
-  /* Count instrumented blocks. */
+  /* Count instrumented blocks (edges after splitting).  */
   unsigned int inst_blocks;
 
-  virtual unsigned int execute(function *fn) {
-
-    if (!isInInstrumentList(fn)) return 0;
-
-    int blocks = 0;
-
-    /* Track whether we split any blocks (e.g., for returns_twice handling).  */
-    bool did_split = false;
-
-    /* Track blocks we've created trampolines for, to avoid reprocessing.  */
-    hash_set<basic_block> returns_twice_handled;
-
-    /* These are temporaries used by inline instrumentation only, that
-       are live throughout the function.  */
-    tree ploc = NULL, indx = NULL, map = NULL, map_ptr = NULL, ntry = NULL,
-         cntr = NULL, xaddc = NULL, xincr = NULL;
-
-    basic_block bb;
-    FOR_EACH_BB_FN(bb, fn) {
-
-      if (!instrument_block_p(fn, bb)) continue;
-
-      if (returns_twice_handled.contains(bb)) continue;
-
-      /* Generate the block identifier.  */
-      unsigned bid = AFL_R(MAP_SIZE);
-      tree     bidt = build_int_cst(sizetype, bid);
-
-      gimple_seq seq = NULL;
-
-      if (out_of_line) {
-
-        static tree afl_trace = get_afl_trace_decl();
-
-        /* Call __afl_trace with bid, the new location;  */
-        gcall *call = gimple_build_call(afl_trace, 1, bidt);
-        gimple_seq_add_stmt(&seq, call);
-
-      } else {
-
-        static tree afl_prev_loc = get_afl_prev_loc_decl();
-        static tree afl_area_ptr = get_afl_area_ptr_decl();
-
-        /* Load __afl_prev_loc to a temporary ploc.  */
-        if (blocks == 0)
-          ploc = create_tmp_var(TREE_TYPE(afl_prev_loc), ".afl_prev_loc");
-        auto load_loc = gimple_build_assign(ploc, afl_prev_loc);
-        gimple_seq_add_stmt(&seq, load_loc);
-
-        /* Compute the index into the map referenced by area_ptr
-           that we're to update: indx = (sizetype) ploc ^ bid.  */
-        if (blocks == 0) indx = create_tmp_var(TREE_TYPE(bidt), ".afl_index");
-        auto conv_ploc =
-            gimple_build_assign(indx, fold_convert(TREE_TYPE(indx), ploc));
-        gimple_seq_add_stmt(&seq, conv_ploc);
-        auto xor_loc = gimple_build_assign(indx, BIT_XOR_EXPR, indx, bidt);
-        gimple_seq_add_stmt(&seq, xor_loc);
-
-        /* Compute the address of that map element.  */
-        if (blocks == 0) {
-
-          map = afl_area_ptr;
-          map_ptr = create_tmp_var(TREE_TYPE(afl_area_ptr), ".afl_map_ptr");
-          ntry = create_tmp_var(TREE_TYPE(afl_area_ptr), ".afl_map_entry");
-
-        }
-
-        /* .map_ptr is initialized at the function entry point, if we
-           instrument any blocks, see below.  */
-
-        /* .entry = &map_ptr[.index]; */
-        auto idx_map =
-            gimple_build_assign(ntry, POINTER_PLUS_EXPR, map_ptr, indx);
-        gimple_seq_add_stmt(&seq, idx_map);
-
-        /* Prepare to add constant 1 to it.  */
-        tree incrv = build_one_cst(TREE_TYPE(TREE_TYPE(ntry)));
-
-        if (neverZero) {
-
-          /* Increment the counter in idx_map.  */
-          tree memref = build2(MEM_REF, TREE_TYPE(TREE_TYPE(ntry)), ntry,
-                               build_zero_cst(TREE_TYPE(ntry)));
-
-          if (blocks == 0)
-            cntr = create_tmp_var(TREE_TYPE(memref), ".afl_edge_count");
-
-          /* Load the count from the entry.  */
-          auto load_cntr = gimple_build_assign(cntr, memref);
-          gimple_seq_add_stmt(&seq, load_cntr);
-
-          /* NeverZero: if count wrapped around to zero, advance to
-             one.  */
-          if (blocks == 0) {
-
-            xaddc = create_tmp_var(build_complex_type(TREE_TYPE(memref)),
-                                   ".afl_edge_xaddc");
-            xincr = create_tmp_var(TREE_TYPE(memref), ".afl_edge_xincr");
-
-          }
-
-          /* Call the ADD_OVERFLOW builtin, to add 1 (in incrv) to
-             count.  The builtin yields a complex pair: the result of
-             the add in the real part, and the overflow flag in the
-             imaginary part, */
-          auto_vec<tree> vargs(2);
-          vargs.quick_push(cntr);
-          vargs.quick_push(incrv);
-          gcall *add1_cntr =
-              gimple_build_call_internal_vec(IFN_ADD_OVERFLOW, vargs);
-          gimple_call_set_lhs(add1_cntr, xaddc);
-          gimple_seq_add_stmt(&seq, add1_cntr);
-
-          /* Extract the real part into count.  */
-          tree cntrb = build1(REALPART_EXPR, TREE_TYPE(cntr), xaddc);
-          auto xtrct_cntr = gimple_build_assign(cntr, cntrb);
-          gimple_seq_add_stmt(&seq, xtrct_cntr);
-
-          /* Extract the imaginary part into xincr.  */
-          tree incrb = build1(IMAGPART_EXPR, TREE_TYPE(xincr), xaddc);
-          auto xtrct_xincr = gimple_build_assign(xincr, incrb);
-          gimple_seq_add_stmt(&seq, xtrct_xincr);
-
-          /* Arrange for the add below to use the overflow flag stored
-             in xincr.  */
-          incrv = xincr;
-
-          /* Add the increment (1 or the overflow bit) to count.  */
-          auto incr_cntr = gimple_build_assign(cntr, PLUS_EXPR, cntr, incrv);
-          gimple_seq_add_stmt(&seq, incr_cntr);
-
-          /* Store count in the map entry.  */
-          auto store_cntr = gimple_build_assign(unshare_expr(memref), cntr);
-          gimple_seq_add_stmt(&seq, store_cntr);
-
-        } else {
-
-          /* Use a serialized memory model.  */
-          tree memmod = build_int_cst(integer_type_node, MEMMODEL_SEQ_CST);
-
-          tree fadd = builtin_decl_explicit(BUILT_IN_ATOMIC_FETCH_ADD_1);
-          auto incr_cntr = gimple_build_call(fadd, 3, ntry, incrv, memmod);
-          gimple_seq_add_stmt(&seq, incr_cntr);
-
-        }
-
-        /* Store bid >> 1 in __afl_prev_loc.  */
-        auto shift_loc =
-            gimple_build_assign(ploc, build_int_cst(TREE_TYPE(ploc), bid >> 1));
-        gimple_seq_add_stmt(&seq, shift_loc);
-        auto store_loc = gimple_build_assign(afl_prev_loc, ploc);
-        gimple_seq_add_stmt(&seq, store_loc);
-
-      }
-
-      /* Insert the generated sequence.  */
-      if (block_has_returns_twice(bb)) {
-
-        /* For blocks with returns_twice calls (setjmp), we must not
-           insert instrumentation before the call. Instead, we create a
-           trampoline block for normal entry and redirect normal edges
-           to it. Abnormal edges (from longjmp) go directly to the
-           original block.  */
-
-        /* Check if this block has any normal (non-abnormal) predecessors.
-           If not, it's only reachable via longjmp and we skip it.
-           See: https://gcc.gnu.org/onlinedocs/gccint/Edges.html  */
-        auto_vec<edge> normal_preds;
-        edge           e;
-        edge_iterator  ei;
-        FOR_EACH_EDGE(e, ei, bb->preds) {
-
-          if (!(e->flags & EDGE_ABNORMAL)) normal_preds.safe_push(e);
-
-        }
-
-        /* Only create trampoline if there are normal predecessors.  */
-        if (!normal_preds.is_empty()) {
-
-          /* GCC caches dominance information for optimization passes.
-             This info becomes invalid when we modify the CFG by
-             splitting blocks and redirecting edges.
-
-             We must free it before CFG modifications, otherwise GCC's
-             internal checks (-fchecking) will fail with errors like:
-             "error: dominator of 9 should be 2, not 3"
-
-             The TODO_update_ssa and TODO_cleanup_cfg flags in
-             todo_flags_finish ensure GCC recomputes what it needs
-             after our pass completes.  */
-          if (dom_info_available_p(CDI_DOMINATORS))
-            free_dominance_info(CDI_DOMINATORS);
-          if (dom_info_available_p(CDI_POST_DOMINATORS))
-            free_dominance_info(CDI_POST_DOMINATORS);
-
-          /* Create trampoline by splitting at the start of the block.
-             split_block_after_labels splits before any statements,
-             creating an empty predecessor block.  */
-          edge split_e = split_block_after_labels(bb);
-
-          /* After split_block_after_labels(bb):
-             - bb becomes empty (the trampoline)
-             - split_e->dest is the new block with original statements
-             - All original predecessors now point to bb (trampoline)  */
-          basic_block trampoline = bb;
-          basic_block original = split_e->dest;
-
-          /* Mark the original block as handled so we don't reprocess it
-             when we encounter it later in the FOR_EACH_BB_FN loop.  */
-          returns_twice_handled.add(original);
-
-          /* Redirect abnormal edges to bypass trampoline.
-             Iterate over a copy since we're modifying edges.  */
-          auto_vec<edge> abnormal_preds;
-          FOR_EACH_EDGE(e, ei, trampoline->preds) {
-
-            if (e->flags & EDGE_ABNORMAL) abnormal_preds.safe_push(e);
-
-          }
-
-          for (unsigned i = 0; i < abnormal_preds.length(); i++) {
-
-            redirect_edge_succ(abnormal_preds[i], original);
-
-          }
-
-          /* Insert instrumentation in trampoline.  */
-          gimple_stmt_iterator insp = gsi_start_bb(trampoline);
-          gsi_insert_seq_before(&insp, seq, GSI_NEW_STMT);
-
-          did_split = true;
-
-          /* Bump this function's instrumented block counter.  */
-          blocks++;
-
-        }
-
-        /* If no normal predecessors, skip instrumentation entirely
-           (block only reachable via longjmp).  */
-
-      } else {
-
-        /* Normal case: insert instrumentation at block start.  */
-        gimple_stmt_iterator insp = gsi_after_labels(bb);
-        gsi_insert_seq_before(&insp, seq, GSI_SAME_STMT);
-
-        /* Bump this function's instrumented block counter.  */
-        blocks++;
-
-      }
-
-    }
-
-    /* Aggregate the instrumented block count.  */
-    inst_blocks += blocks;
-
-    if (blocks) {
-
-      if (out_of_line) return TODO_rebuild_cgraph_edges;
-
-      gimple_seq seq = NULL;
-
-      /* Load afl_area_ptr into map_ptr.  We want to do this only
-         once per function.  */
-      auto load_ptr = gimple_build_assign(map_ptr, map);
-      gimple_seq_add_stmt(&seq, load_ptr);
-
-      /* Insert it in the edge to the entry block.  We don't want to
-         insert it in the first block, since there might be a loop
-         or a goto back to it.  Insert in the edge, which may create
-         another block.  */
-      edge e = single_succ_edge(ENTRY_BLOCK_PTR_FOR_FN(fn));
-      gsi_insert_seq_on_edge_immediate(e, seq);
-
-      /* If we did any block splitting, also rebuild cgraph edges.  */
-      if (did_split) return TODO_rebuild_cgraph_edges;
-
-    }
-
-    return 0;
+  /* Per-function guard array (set during execute()).  */
+  tree function_guard_array;
+
+  /* Create and return a declaration for __afl_area_ptr.  */
+  static inline tree get_afl_area_ptr_decl() {
+
+    tree type = build_pointer_type(unsigned_char_type_node);
+    tree decl = build_decl(BUILTINS_LOCATION, VAR_DECL,
+                           get_identifier("__afl_area_ptr"), type);
+    TREE_PUBLIC(decl) = 1;
+    DECL_EXTERNAL(decl) = 1;
+    DECL_ARTIFICIAL(decl) = 1;
+    TREE_STATIC(decl) = 1;
+
+    return decl;
 
   }
 
-  /* Decide whether to instrument block BB.  Skip it due to the random
-     distribution, or if it's the single successor of all its
-     predecessors.  */
-  inline bool instrument_block_p(function *fn, basic_block bb) {
+  /* Create a per-function guard array placed in sancov_guards section.
+     For COMDAT functions we intentionally keep per-TU guard arrays (no weak
+     cross-TU coalescing), because different TUs may produce different guard
+     counts for the same function body under different optimization settings.  */
+  tree create_function_guard_array(unsigned int num_guards) {
 
-    if (AFL_R(100) >= (long int)inst_ratio) return false;
+    if (num_guards == 0) return NULL_TREE;
+
+    /* Create array type: uint32_t[num_guards]  */
+    tree array_type = build_array_type_nelts(uint32_type_node, num_guards);
+
+    /* Create variable declaration with unique name.
+       Use static counter for uniqueness (like LLVM's __sancov_gen_).  */
+    char name[64];
+    snprintf(name, sizeof(name), "__sancov_gen_.%u", sancov_id_counter++);
+
+    tree decl =
+        build_decl(BUILTINS_LOCATION, VAR_DECL, get_identifier(name), array_type);
+
+    /* Set attributes  */
+    TREE_PUBLIC(decl) = 0;       /* Not exported  */
+    TREE_STATIC(decl) = 1;       /* Static storage  */
+    DECL_ARTIFICIAL(decl) = 1;   /* Compiler-generated  */
+    TREE_USED(decl) = 1;         /* Mark as used  */
+    DECL_PRESERVE_P(decl) = 1;   /* Prevent elimination  */
+    TREE_ADDRESSABLE(decl) = 1;  /* We take its address  */
+
+    /* Zero-initialize  */
+    DECL_INITIAL(decl) = build_constructor(array_type, NULL);
+
+    /* Place in sancov_guards section  */
+    set_decl_section_name(decl, getSanCovSectionName());
+
+    /* Emit the variable  */
+    varpool_node::finalize_decl(decl);
+
+    sancov_guards_emitted = true;
+
+    return decl;
+
+  }
+
+  /* Emit a TU-level ctor that calls __sanitizer_cov_trace_pc_guard_init
+     with the sancov_guards section bounds. Instrumented objects still
+     require AFL runtime symbols at load/link time.  */
+  static void emit_pcguard_ctor(void) {
+
+    if (!sancov_guards_emitted || sancov_ctor_emitted) { return; }
+    sancov_ctor_emitted = true;
+
+    /* Build (weak) decl for __sanitizer_cov_trace_pc_guard_init */
+    tree guard_ptr_type = build_pointer_type(uint32_type_node);
+    tree fn_type =
+        build_function_type_list(void_type_node, guard_ptr_type, guard_ptr_type,
+                                 NULL_TREE);
+    tree init_decl = build_fn_decl("__sanitizer_cov_trace_pc_guard_init",
+                                   fn_type);
+    TREE_PUBLIC(init_decl) = 1;
+    DECL_EXTERNAL(init_decl) = 1;
+    DECL_WEAK(init_decl) = 1;
+    DECL_ARTIFICIAL(init_decl) = 1;
+
+    /* Build decls for section start/stop symbols */
+#if defined(OBJECT_FORMAT_MACHO)
+    tree start_decl = build_decl(
+        BUILTINS_LOCATION, VAR_DECL, get_identifier("sancov_guards_start"),
+        uint32_type_node);
+    tree stop_decl = build_decl(
+        BUILTINS_LOCATION, VAR_DECL, get_identifier("sancov_guards_stop"),
+        uint32_type_node);
+    TREE_PUBLIC(start_decl) = 1;
+    TREE_PUBLIC(stop_decl) = 1;
+    DECL_EXTERNAL(start_decl) = 1;
+    DECL_EXTERNAL(stop_decl) = 1;
+    DECL_WEAK(start_decl) = 1;
+    DECL_WEAK(stop_decl) = 1;
+    DECL_ARTIFICIAL(start_decl) = 1;
+    DECL_ARTIFICIAL(stop_decl) = 1;
+    overwrite_decl_assembler_name(
+        start_decl, get_identifier("*section$start$__DATA$__sancov_guards"));
+    overwrite_decl_assembler_name(
+        stop_decl, get_identifier("*section$end$__DATA$__sancov_guards"));
+#else
+    tree start_decl = build_decl(
+        BUILTINS_LOCATION, VAR_DECL, get_identifier("__start___sancov_guards"),
+        uint32_type_node);
+    tree stop_decl = build_decl(
+        BUILTINS_LOCATION, VAR_DECL, get_identifier("__stop___sancov_guards"),
+        uint32_type_node);
+    TREE_PUBLIC(start_decl) = 1;
+    TREE_PUBLIC(stop_decl) = 1;
+    DECL_EXTERNAL(start_decl) = 1;
+    DECL_EXTERNAL(stop_decl) = 1;
+    DECL_WEAK(start_decl) = 1;
+    DECL_WEAK(stop_decl) = 1;
+    DECL_ARTIFICIAL(start_decl) = 1;
+    DECL_ARTIFICIAL(stop_decl) = 1;
+#endif
+
+    tree start_addr = build1(ADDR_EXPR, guard_ptr_type, start_decl);
+    tree stop_addr = build1(ADDR_EXPR, guard_ptr_type, stop_decl);
+
+    /* if (&start != NULL && &stop != NULL && &start != &stop && init) */
+    tree nonnull_start =
+        build2(NE_EXPR, boolean_type_node, start_addr,
+               fold_convert(guard_ptr_type, null_pointer_node));
+    tree nonnull_stop =
+        build2(NE_EXPR, boolean_type_node, stop_addr,
+               fold_convert(guard_ptr_type, null_pointer_node));
+    tree different =
+        build2(NE_EXPR, boolean_type_node, start_addr, stop_addr);
+    tree init_ptr =
+        build1(ADDR_EXPR, ptr_type_node, init_decl);
+    tree init_nonnull =
+        build2(NE_EXPR, boolean_type_node, init_ptr,
+               fold_convert(ptr_type_node, null_pointer_node));
+
+    tree cond = build2(TRUTH_ANDIF_EXPR, boolean_type_node, nonnull_start,
+                       nonnull_stop);
+    cond = build2(TRUTH_ANDIF_EXPR, boolean_type_node, cond, different);
+    cond = build2(TRUTH_ANDIF_EXPR, boolean_type_node, cond, init_nonnull);
+
+    tree call = build_call_expr(init_decl, 2, start_addr, stop_addr);
+    tree if_stmt = build3(COND_EXPR, void_type_node, cond, call,
+                          build_empty_stmt(BUILTINS_LOCATION));
+
+    tree body = alloc_stmt_list();
+    append_to_statement_list(if_stmt, &body);
+
+    cgraph_build_static_cdtor('I', body, 2);
+
+  }
+
+  /* Check if BB contains a returns_twice call (e.g., setjmp).  */
+  inline bool block_has_returns_twice(basic_block bb) {
+
+    for (gimple_stmt_iterator gsi = gsi_start_bb(bb); !gsi_end_p(gsi);
+         gsi_next(&gsi)) {
+
+      if (gimple_code(gsi_stmt(gsi)) == GIMPLE_CALL) {
+
+        if (gimple_call_flags(gsi_stmt(gsi)) & ECF_RETURNS_TWICE) return true;
+
+      }
+
+    }
+
+    return false;
+
+  }
+
+  /* Check if BB is a "full dominator" - dominates ALL its successors.
+     Based on LLVM's isFullDominator.  */
+  bool is_full_dominator(basic_block bb) {
+
+    if (EDGE_COUNT(bb->succs) == 0) return false;
+
+    edge          e;
+    edge_iterator ei;
+    FOR_EACH_EDGE(e, ei, bb->succs) {
+
+      if (!dominated_by_p(CDI_DOMINATORS, e->dest, bb)) return false;
+
+    }
+
+    return true;
+
+  }
+
+  /* Check if BB is a "full post-dominator" - post-dominates ALL predecessors.
+     Based on LLVM's isFullPostDominator.  */
+  bool is_full_post_dominator(basic_block bb) {
+
+    if (EDGE_COUNT(bb->preds) == 0) return false;
+
+    edge          e;
+    edge_iterator ei;
+    FOR_EACH_EDGE(e, ei, bb->preds) {
+
+      if (!dominated_by_p(CDI_POST_DOMINATORS, e->src, bb)) return false;
+
+    }
+
+    return true;
+
+  }
+
+  /* Split critical edges while ignoring unreachable fallthrough destinations,
+     matching LLVM's IgnoreUnreachableDests behavior.
+
+     On GCC < 8, assert_unreachable_fallthru_edge_p is not declared in
+     tree-cfg.h, so fall back to split_edges_for_insertion() which splits
+     all critical edges unconditionally (a few extra blocks, but they are
+     filtered out by should_instrument_block's __builtin_unreachable check).  */
+#if GCC_VERSION >= 8000
+  void split_pcguard_edges(function *fn) {
+
+    auto_vec<edge> edges_to_split;
+    basic_block    bb;
+    edge           e;
+    edge_iterator  ei;
+
+    FOR_EACH_BB_FN(bb, fn) {
+
+      FOR_EACH_EDGE(e, ei, bb->succs) {
+
+        if (!EDGE_CRITICAL_P(e)) continue;
+        if (e->flags & EDGE_COMPLEX) continue;
+        if ((e->flags & EDGE_FALLTHRU) &&
+            assert_unreachable_fallthru_edge_p(e))
+          continue;
+        edges_to_split.safe_push(e);
+
+      }
+
+    }
+
+    for (unsigned i = 0; i < edges_to_split.length(); i++) {
+
+      split_edge(edges_to_split[i]);
+
+    }
+
+  }
+
+#else
+  void split_pcguard_edges(function *) {
+
+    split_edges_for_insertion();
+
+  }
+
+#endif
+
+  /* Main block selection logic - matches LLVM's shouldInstrumentBlock
+     with additional handling for returns_twice blocks.  */
+  bool should_instrument_block(basic_block bb, function *fn) {
+
+    /* Skip entry and exit pseudo-blocks  */
+    if (bb == ENTRY_BLOCK_PTR_FOR_FN(fn)) return false;
+    if (bb == EXIT_BLOCK_PTR_FOR_FN(fn)) return false;
+
+    /* Entry block (first real block) - always instrument  */
+    if (bb == single_succ_edge(ENTRY_BLOCK_PTR_FOR_FN(fn))->dest) return true;
+
+    /* Skip blocks without a valid insertion point or unreachable blocks.  */
+    gimple_stmt_iterator gsi = gsi_after_labels(bb);
+    if (gsi_end_p(gsi)) {
+
+      /* split_edge() creates empty blocks for critical edges; instrument them
+         unless they are truly unreachable.  */
+      if (EDGE_COUNT(bb->preds) == 0) return false;
+      return true;
+
+    }
+    if (gimple_code(gsi_stmt(gsi)) == GIMPLE_CALL &&
+        gimple_call_builtin_p(gsi_stmt(gsi), BUILT_IN_UNREACHABLE))
+      return false;
 
 /* GCC versions < 15 can ICE in purge_dead_edges during RTL CFG cleanup when
    side-effecting instrumentation is injected into EH-only dispatcher/resx
@@ -491,87 +451,216 @@ struct afl_pass : afl_base_pass {
 
 #endif
 
-    edge          e;
-    edge_iterator ei;
-    FOR_EACH_EDGE(e, ei, bb->preds)
-    if (!single_succ_p(e->src)) return true;
+    /* Returns_twice blocks (setjmp): skip if only reachable via longjmp  */
+    if (block_has_returns_twice(bb)) {
 
-    return false;
+      bool          has_normal_pred = false;
+      edge          e;
+      edge_iterator ei;
+      FOR_EACH_EDGE(e, ei, bb->preds) {
+
+        if (!(e->flags & EDGE_ABNORMAL)) {
+
+          has_normal_pred = true;
+          break;
+
+        }
+
+      }
+
+      if (!has_normal_pred) return false;
+
+    }
+
+    /* Skip full dominators - their execution is implied by successors  */
+    if (is_full_dominator(bb)) return false;
+
+    /* Skip full post-dominators with multiple predecessors  */
+    if (is_full_post_dominator(bb) && !single_pred_p(bb)) return false;
+
+    return true;
 
   }
 
-  /* Check if BB contains a returns_twice call (e.g., setjmp).
-     Returns true if such a call exists anywhere in the block.  */
-  inline bool block_has_returns_twice(basic_block bb) {
+  /* Insert guard-based instrumentation into a basic block.
+     Matches LLVM's approach exactly:
+       1. Load guard value (map index)
+       2. Load map pointer (in every block - let optimizer hoist)
+       3. GEP to map entry
+       4. Load counter, add 1, (NeverZero: if zero add 1), store  */
+  void insert_guard_instrumentation(basic_block bb, unsigned int guard_idx) {
 
-    for (gimple_stmt_iterator gsi = gsi_start_bb(bb); !gsi_end_p(gsi);
-         gsi_next(&gsi)) {
+    gimple_seq seq = NULL;
+    static tree afl_area_ptr_decl = get_afl_area_ptr_decl();
 
-      if (gimple_code(gsi_stmt(gsi)) == GIMPLE_CALL) {
+    /* Load guard value: edge_id = guard_array[guard_idx]  */
+    tree guard_ref =
+        build4(ARRAY_REF, uint32_type_node, function_guard_array,
+               build_int_cst(sizetype, guard_idx), NULL_TREE, NULL_TREE);
+    tree edge_id = create_tmp_var(uint32_type_node, ".edge_id");
+    gimple_seq_add_stmt(&seq, gimple_build_assign(edge_id, guard_ref));
 
-        if (gimple_call_flags(gsi_stmt(gsi)) & ECF_RETURNS_TWICE) return true;
+    /* Load map pointer (like LLVM - in every block)  */
+    tree map_ptr = create_tmp_var(TREE_TYPE(afl_area_ptr_decl), ".afl_map_ptr");
+    gimple_seq_add_stmt(&seq, gimple_build_assign(map_ptr, afl_area_ptr_decl));
+
+    /* Compute map entry address: entry = map_ptr + edge_id  */
+    tree edge_id_sized = create_tmp_var(sizetype, ".edge_id_sized");
+    gimple_seq_add_stmt(
+        &seq, gimple_build_assign(edge_id_sized, NOP_EXPR, edge_id));
+
+    tree entry = create_tmp_var(TREE_TYPE(map_ptr), ".afl_map_entry");
+    gimple_seq_add_stmt(
+        &seq, gimple_build_assign(entry, POINTER_PLUS_EXPR, map_ptr, edge_id_sized));
+
+    /* Load counter, increment, store  */
+    tree memref = build2(MEM_REF, unsigned_char_type_node, entry,
+                         build_zero_cst(TREE_TYPE(entry)));
+    tree counter = create_tmp_var(unsigned_char_type_node, ".afl_counter");
+    gimple_seq_add_stmt(&seq, gimple_build_assign(counter, memref));
+
+    /* counter = counter + 1  */
+    tree one = build_one_cst(unsigned_char_type_node);
+    gimple_seq_add_stmt(&seq, gimple_build_assign(counter, PLUS_EXPR, counter, one));
+
+    if (neverZero) {
+
+      /* NeverZero: if counter wrapped to 0, set it to 1
+         Same logic as LLVM: carry = (counter == 0); counter += carry  */
+      tree zero = build_zero_cst(unsigned_char_type_node);
+      tree is_zero = create_tmp_var(boolean_type_node, ".is_zero");
+      gimple_seq_add_stmt(&seq, gimple_build_assign(is_zero, EQ_EXPR, counter, zero));
+
+      tree carry = create_tmp_var(unsigned_char_type_node, ".carry");
+      gimple_seq_add_stmt(&seq, gimple_build_assign(carry, NOP_EXPR, is_zero));
+
+      gimple_seq_add_stmt(&seq, gimple_build_assign(counter, PLUS_EXPR, counter, carry));
+
+    }
+
+    /* Store counter back  */
+    gimple_seq_add_stmt(&seq, gimple_build_assign(unshare_expr(memref), counter));
+
+    /* Insert at block start (after labels)  */
+    gimple_stmt_iterator insp = gsi_after_labels(bb);
+    gsi_insert_seq_before(&insp, seq, GSI_SAME_STMT);
+
+  }
+
+  virtual unsigned int execute(function *fn) {
+
+    /* Do not instrument compiler-generated static ctor/dtor wrappers
+       (e.g. the TU-level PC Guard init ctor emitted below). Keep
+       user-defined constructors instrumentable. */
+    if (is_artificial_static_ctor_dtor(fn->decl)) return 0;
+
+    if (!isInInstrumentList(fn)) return 0;
+
+    /* Respect __attribute__((no_sanitize_coverage)) (GCC 14+).
+       On older GCC the attribute is unrecognized/dropped, so
+       lookup_attribute returns NULL_TREE (safe no-op).  */
+    if (lookup_attribute("no_sanitize_coverage", DECL_ATTRIBUTES(fn->decl)))
+      return 0;
+
+    /* 1. Split critical edges for true edge coverage.  */
+    split_pcguard_edges(fn);
+
+    /* 2. Free any stale dominance info (CFG was modified)  */
+    if (dom_info_available_p(CDI_DOMINATORS))
+      free_dominance_info(CDI_DOMINATORS);
+    if (dom_info_available_p(CDI_POST_DOMINATORS))
+      free_dominance_info(CDI_POST_DOMINATORS);
+
+    /* 3. Compute fresh dominance info  */
+    calculate_dominance_info(CDI_DOMINATORS);
+    calculate_dominance_info(CDI_POST_DOMINATORS);
+
+    /* 4. Collect blocks to instrument (no CFG changes here)  */
+    auto_vec<basic_block>  blocks_to_instrument;
+    hash_set<basic_block>  returns_twice_blocks;
+    basic_block            bb;
+
+    FOR_EACH_BB_FN(bb, fn) {
+
+      if (!should_instrument_block(bb, fn)) continue;
+
+      blocks_to_instrument.safe_push(bb);
+
+      if (block_has_returns_twice(bb)) { returns_twice_blocks.add(bb); }
+
+    }
+
+    /* 5. Early exit if nothing to instrument  */
+    unsigned int num_guards = blocks_to_instrument.length();
+    if (num_guards == 0) { return 0; }
+
+    /* 6. Create guard array for this function  */
+    function_guard_array = create_function_guard_array(num_guards);
+
+    /* 7. Instrument collected blocks  */
+    unsigned int guard_idx = 0;
+    for (unsigned i = 0; i < blocks_to_instrument.length(); i++) {
+
+      bb = blocks_to_instrument[i];
+
+      /* Handle returns_twice blocks (setjmp) - create trampoline  */
+      if (returns_twice_blocks.contains(bb)) {
+
+        /* Free dominance info before CFG modification  */
+        if (dom_info_available_p(CDI_DOMINATORS))
+          free_dominance_info(CDI_DOMINATORS);
+        if (dom_info_available_p(CDI_POST_DOMINATORS))
+          free_dominance_info(CDI_POST_DOMINATORS);
+
+        /* Split block to create trampoline  */
+        edge        split_e = split_block_after_labels(bb);
+        basic_block trampoline = bb;
+        basic_block original = split_e->dest;
+
+        /* Redirect abnormal edges to bypass trampoline  */
+        auto_vec<edge> abnormal_preds;
+        edge           e;
+        edge_iterator  ei;
+        FOR_EACH_EDGE(e, ei, trampoline->preds) {
+
+          if (e->flags & EDGE_ABNORMAL) abnormal_preds.safe_push(e);
+
+        }
+
+        for (unsigned j = 0; j < abnormal_preds.length(); j++) {
+
+          redirect_edge_succ(abnormal_preds[j], original);
+
+        }
+
+        /* Insert instrumentation in trampoline  */
+        insert_guard_instrumentation(trampoline, guard_idx++);
+
+      } else {
+
+        /* Normal case: insert instrumentation at block start  */
+        insert_guard_instrumentation(bb, guard_idx++);
 
       }
 
     }
 
-    return false;
+    inst_blocks += guard_idx;
+
+    /* Free dominance info since we may have modified CFG  */
+    if (dom_info_available_p(CDI_DOMINATORS))
+      free_dominance_info(CDI_DOMINATORS);
+    if (dom_info_available_p(CDI_POST_DOMINATORS))
+      free_dominance_info(CDI_POST_DOMINATORS);
+
+    /* Rebuild callgraph edges: the inline instrumentation references
+       __afl_area_ptr and the guard arrays, introducing new variable
+       references that the callgraph must track.  */
+    return TODO_rebuild_cgraph_edges;
 
   }
 
-  /* Create and return a declaration for the __afl_trace rt function.  */
-  static inline tree get_afl_trace_decl() {
-
-    tree type =
-        build_function_type_list(void_type_node, uint16_type_node, NULL_TREE);
-    tree decl = build_fn_decl("__afl_trace", type);
-
-    TREE_PUBLIC(decl) = 1;
-    DECL_EXTERNAL(decl) = 1;
-    DECL_ARTIFICIAL(decl) = 1;
-
-    return decl;
-
-  }
-
-  /* Create and return a declaration for the __afl_prev_loc
-     thread-local variable.  */
-  static inline tree get_afl_prev_loc_decl() {
-
-    tree decl = build_decl(BUILTINS_LOCATION, VAR_DECL,
-                           get_identifier("__afl_prev_loc"), uint32_type_node);
-    TREE_PUBLIC(decl) = 1;
-    DECL_EXTERNAL(decl) = 1;
-    DECL_ARTIFICIAL(decl) = 1;
-    TREE_STATIC(decl) = 1;
-#if !defined(__ANDROID__) && !defined(__HAIKU__)
-    set_decl_tls_model(
-        decl, (flag_pic ? TLS_MODEL_INITIAL_EXEC : TLS_MODEL_LOCAL_EXEC));
-#endif
-    return decl;
-
-  }
-
-  /* Create and return a declaration for the __afl_prev_loc
-     thread-local variable.  */
-  static inline tree get_afl_area_ptr_decl() {
-
-    /* If type changes, the size N in FETCH_ADD_<N> must be adjusted
-       in builtin calls above.  */
-    tree type = build_pointer_type(unsigned_char_type_node);
-    tree decl = build_decl(BUILTINS_LOCATION, VAR_DECL,
-                           get_identifier("__afl_area_ptr"), type);
-    TREE_PUBLIC(decl) = 1;
-    DECL_EXTERNAL(decl) = 1;
-    DECL_ARTIFICIAL(decl) = 1;
-    TREE_STATIC(decl) = 1;
-
-    return decl;
-
-  }
-
-  /* This is registered as a plugin finalize callback, to print an
-     instrumentation summary unless in quiet mode.  */
+  /* Plugin finalize callback - print summary.  */
   static void plugin_finalize(void *, void *p) {
 
     opt_pass *op = (opt_pass *)p;
@@ -582,11 +671,8 @@ struct afl_pass : afl_base_pass {
       if (!self.inst_blocks)
         WARNF("No instrumentation targets found.");
       else
-        OKF("Instrumented %u locations (%s mode, %s, ratio %u%%).",
-            self.inst_blocks,
-            getenv("AFL_HARDEN") ? G_("hardened") : G_("non-hardened"),
-            self.out_of_line ? G_("out of line") : G_("inline"),
-            self.inst_ratio);
+        OKF("Instrumented %u edges (PC Guard mode, %s).", self.inst_blocks,
+            getenv("AFL_HARDEN") ? G_("hardened") : G_("non-hardened"));
 
     }
 
@@ -594,26 +680,43 @@ struct afl_pass : afl_base_pass {
 
 };
 
+static void pcguard_start_unit(void *, void *) {
+
+  sancov_guards_emitted = false;
+  sancov_ctor_emitted = false;
+
+}
+
+static void pcguard_finish_unit(void *, void *) {
+
+  afl_pass::emit_pcguard_ctor();
+
+}
+
 static struct plugin_info afl_plugin = {
 
-    .version = "20220420",
-    .help = G_("AFL gcc plugin\n\
+    .version = "20250205",
+    .help = G_("AFL++ GCC plugin (PC Guard edge coverage)\n\
 \n\
-Set AFL_QUIET in the environment to silence it.\n\
-Set AFL_GCC_ONLY_FRSV in the environment to disable instrumentation.\n\
+Platform: ELF (Linux, BSD) and Mach-O (macOS)\n\
+Architecture: Any (x86, x86_64, ARM, AArch64, RISC-V, etc.)\n\
 \n\
-Set AFL_INST_RATIO in the environment to a number from 0 to 100\n\
-to control how likely a block will be chosen for instrumentation.\n\
+Environment variables:\n\
+  AFL_QUIET              - Suppress output\n\
+  AFL_GCC_ONLY_FSRV      - Disable instrumentation (forkserver only)\n\
+  AFL_GCC_SKIP_NEVERZERO - Disable NeverZero counter handling\n\
+  AFL_INST_RATIO         - Handled at runtime by AFL++ runtime\n\
 \n\
-Specify -frandom-seed for reproducible instrumentation.\n\
+Removed (no longer supported):\n\
+  AFL_GCC_OUT_OF_LINE    - Was: out-of-line call-based instrumentation.\n\
+                           Now always uses inline PC Guard instrumentation.\n\
 "),
 
 };
 
 }  // namespace
 
-/* This is the function GCC calls when loading a plugin.  Initialize
-   and register further callbacks.  */
+/* Plugin initialization - register callbacks.  */
 int plugin_init(struct plugin_name_args   *info,
                 struct plugin_gcc_version *version) {
 
@@ -627,11 +730,8 @@ int plugin_init(struct plugin_name_args   *info,
   bool quiet = false;
   if (isatty(2) && !getenv("AFL_QUIET")) {
 
-    SAYF(cCYA "afl-gcc-pass " cBRI VERSION cRST " by <oliva@adacore.com>\n");
-    SAYF(cRED
-         "Warning: gcc plugins are currently unmaintained and have known "
-         "issues. Help maintaining by submitting PRs or sponsoring a "
-         "maintainer.\n");
+    SAYF(cCYA "afl-gcc-pass " cBRI VERSION cRST
+              " by <oliva@adacore.com, aflplusplus@gmail.com>\n");
 
   } else {
 
@@ -639,23 +739,19 @@ int plugin_init(struct plugin_name_args   *info,
 
   }
 
-  /* Decide instrumentation ratio.  */
-  unsigned int inst_ratio = 100U;
-  if (char *inst_ratio_str = getenv("AFL_INST_RATIO"))
-    if (sscanf(inst_ratio_str, "%u", &inst_ratio) != 1 || !inst_ratio ||
-        inst_ratio > 100)
-      FATAL(G_("Bad value of AFL_INST_RATIO (must be between 1 and 100)"));
+  /* Warn about removed/changed environment variables.  */
+  if (getenv("AFL_GCC_OUT_OF_LINE"))
+    WARNF(
+        "AFL_GCC_OUT_OF_LINE is no longer supported. The GCC plugin now uses "
+        "PC Guard instrumentation which is always inline. Ignoring.");
 
-  /* Initialize the random number generator with GCC's random seed, in
-     case it was specified in the command line's -frandom-seed for
-     reproducible instrumentation.  */
-  srandom(get_random_seed(false));
-  bool fsrv_only = !!getenv("AFL_GCC_ONLY_FRSV");
+  bool fsrv_only =
+      !!(getenv("AFL_GCC_ONLY_FSRV") || getenv("AFL_GCC_ONLY_FRSV"));
 
   const char *name = info->base_name;
   if (!fsrv_only) { register_callback(name, PLUGIN_INFO, NULL, &afl_plugin); }
 
-  afl_pass                 *aflp = new afl_pass(quiet, inst_ratio);
+  afl_pass                 *aflp = new afl_pass(quiet);
   struct register_pass_info pass_info = {
 
       .pass = aflp,
@@ -670,17 +766,22 @@ int plugin_init(struct plugin_name_args   *info,
     register_callback(name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
     register_callback(name, PLUGIN_FINISH, afl_pass::plugin_finalize,
                       pass_info.pass);
+    register_callback(name, PLUGIN_START_UNIT, pcguard_start_unit, nullptr);
+    register_callback(name, PLUGIN_FINISH_UNIT, pcguard_finish_unit, nullptr);
 
   }
 
-  if (!quiet)
-    ACTF(G_("%s instrumentation at ratio of %u%% in %s mode."),
-         aflp->out_of_line ? G_("Call-based") : G_("Inline"), inst_ratio,
+  if (fsrv_only) {
+
+    ACTF("Instrumentation disabled due to AFL_GCC_ONLY_FSRV");
+
+  } else if (!quiet) {
+
+    ACTF(G_("PC Guard edge coverage instrumentation (%s mode)."),
          getenv("AFL_HARDEN") ? G_("hardened") : G_("non-hardened"));
-  else if (fsrv_only)
-    ACTF("Instrumentation disabled due to AFL_GCC_ONLY_FRSV");
+
+  }
 
   return 0;
 
 }
-

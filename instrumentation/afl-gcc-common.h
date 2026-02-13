@@ -60,6 +60,7 @@
 #include <gimple-expr.h>
 #include <gimple.h>
 #include <gimple-iterator.h>
+#include <tree-iterator.h>
 #include <stringpool.h>
 #include <gimple-ssa.h>
 #if defined(__has_include) && __has_include(<tree-vrp.h>)
@@ -73,6 +74,28 @@
 #include <ssa-iterators.h>
 
 #include <intl.h>
+
+/* Additional headers needed by afl-gcc-pass.so.cc for PC Guard mode.
+   These must be included BEFORE the gimple macro below, as they
+   internally use 'gimple' as a type.  */
+#if defined(__has_include) && __has_include(<dominance.h>)
+  #include <dominance.h>
+#endif
+#if defined(__has_include) && __has_include(<tree-cfg.h>)
+  #include <tree-cfg.h>
+#endif
+#if defined(__has_include) && __has_include(<varasm.h>)
+  #include <varasm.h>
+#endif
+#if defined(__has_include) && __has_include(<cfghooks.h>)
+  #include <cfghooks.h>
+#endif
+#if defined(__has_include) && __has_include(<cgraph.h>)
+  #include <cgraph.h>
+#endif
+#if defined(__has_include) && __has_include(<attribs.h>)
+  #include <attribs.h>
+#endif
 
 #if defined(__clang__)
   #pragma clang diagnostic pop
@@ -114,6 +137,7 @@ struct afl_base_pass : gimple_opt_pass {
         "asan.",
         "llvm.",
         "sancov.",
+        "__sanitizer_",
         "__ubsan_",
         "ign.",
         "__afl_",
