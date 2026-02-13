@@ -21,9 +21,15 @@
     - LLVM 22 support (they are again switching around include files ...)
     - g_/curl_/xml_ string support for COMPCOV, thanks to @Prajwal-kp-18
     - env `AFL_LLVM_DENY_EXEC` will abort any common exec calls
-    - marked GCC plugins as unmaintained. We need someone who know gimple and
-      is willing to fix the plugin issues, workarounds for gcc bugs and
-      overall improve the plugin.
+    - GCC plugin: rewrote instrumentation from XOR-based tracing to
+      collision-free PC Guard (PCGUARD) edge coverage, matching the LLVM
+      SanitizerCoverage approach. Includes critical edge splitting,
+      dominator-based pruning, COMDAT TU-local guard arrays, setjmp
+      trampoline support, and comprehensive tests. The old `AFL_GCC_OUT_OF_LINE`
+      env var is removed (ignored with a warning).
+    - GCC plugin: fixed `isIgnoreFunction()` prefix matching in
+      `afl-gcc-common.h` (was comparing against function name length
+      instead of pattern length).
   - afl-cmin:
     - new implementation in C by @kcwu - thanks! (it is the default now)
     - afl-cmin.py was changing behaviour to hash the original filenames,

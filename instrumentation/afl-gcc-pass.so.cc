@@ -67,7 +67,7 @@ namespace {
    we fall back to GCC-generated wrapper naming conventions. */
 static inline bool is_artificial_static_ctor_dtor(const_tree decl) {
 
-  if (!decl || !DECL_ARTIFICIAL(decl)) return false;
+  if (!decl) return false;
 
 #ifdef DECL_STATIC_CONSTRUCTOR
   if (DECL_STATIC_CONSTRUCTOR(decl)) return true;
@@ -77,19 +77,34 @@ static inline bool is_artificial_static_ctor_dtor(const_tree decl) {
 #endif
 
   const_tree ident = DECL_NAME(decl);
-  if (!ident) return false;
+  const char *name = ident ? IDENTIFIER_POINTER(ident) : NULL;
 
-  const char *name = IDENTIFIER_POINTER(ident);
-  if (!name) return false;
+  const char *asm_name = NULL;
+  tree        asm_ident = DECL_ASSEMBLER_NAME(const_cast<tree>(decl));
+  if (asm_ident) asm_name = IDENTIFIER_POINTER(asm_ident);
 
   /* Common GCC-generated init/fini wrapper names:
      - prefixes "_sub_I_" / "_sub_D_" (cgraph_build_static_cdtor wrappers)
      - prefixes "_GLOBAL__sub_I_" / "_GLOBAL__sub_D_" (C++ wrappers)
-     - "__static_initialization_and_destruction_" helpers */
-  return !strncmp(name, "_sub_I_", 7) || !strncmp(name, "_sub_D_", 7) ||
-         !strncmp(name, "_GLOBAL__sub_I_", 15) ||
-         !strncmp(name, "_GLOBAL__sub_D_", 15) ||
-         !strncmp(name, "__static_initialization_and_destruction_", 41);
+     - "__static_initialization_and_destruction_" helpers (unmangled)
+     - "_Z41__static_initialization_and_destruction_" (Itanium mangled)
+
+     Some GCC versions do not mark all wrappers as DECL_ARTIFICIAL, so keep
+     this fallback independent of DECL_ARTIFICIAL and also check the assembler
+     symbol name. */
+  auto matches_wrapper_name = [](const char *n) {
+
+    if (!n) return false;
+
+    return !strncmp(n, "_sub_I_", 7) || !strncmp(n, "_sub_D_", 7) ||
+           !strncmp(n, "_GLOBAL__sub_I_", 15) ||
+           !strncmp(n, "_GLOBAL__sub_D_", 15) ||
+           !strncmp(n, "__static_initialization_and_destruction_", 41) ||
+           !strncmp(n, "_Z41__static_initialization_and_destruction_", 45);
+
+  };
+
+  return matches_wrapper_name(name) || matches_wrapper_name(asm_name);
 
 }
 
@@ -414,9 +429,6 @@ struct afl_pass : afl_base_pass {
     if (bb == ENTRY_BLOCK_PTR_FOR_FN(fn)) return false;
     if (bb == EXIT_BLOCK_PTR_FOR_FN(fn)) return false;
 
-    /* Entry block (first real block) - always instrument  */
-    if (bb == single_succ_edge(ENTRY_BLOCK_PTR_FOR_FN(fn))->dest) return true;
-
     /* Skip blocks without a valid insertion point or unreachable blocks.  */
     gimple_stmt_iterator gsi = gsi_after_labels(bb);
     if (gsi_end_p(gsi)) {
@@ -430,6 +442,9 @@ struct afl_pass : afl_base_pass {
     if (gimple_code(gsi_stmt(gsi)) == GIMPLE_CALL &&
         gimple_call_builtin_p(gsi_stmt(gsi), BUILT_IN_UNREACHABLE))
       return false;
+
+    /* Entry block (first real block) - always instrument if reachable.  */
+    if (bb == single_succ_edge(ENTRY_BLOCK_PTR_FOR_FN(fn))->dest) return true;
 
 /* GCC versions < 15 can ICE in purge_dead_edges during RTL CFG cleanup when
    side-effecting instrumentation is injected into EH-only dispatcher/resx
@@ -592,7 +607,18 @@ struct afl_pass : afl_base_pass {
 
     /* 5. Early exit if nothing to instrument  */
     unsigned int num_guards = blocks_to_instrument.length();
-    if (num_guards == 0) { return 0; }
+    if (num_guards == 0) {
+
+      /* split_pcguard_edges() above may have invalidated dominance data.
+         Even when we do not instrument this function, leaving stale
+         dominance info behind can trip later GCC todo passes. */
+      if (dom_info_available_p(CDI_DOMINATORS))
+        free_dominance_info(CDI_DOMINATORS);
+      if (dom_info_available_p(CDI_POST_DOMINATORS))
+        free_dominance_info(CDI_POST_DOMINATORS);
+      return 0;
+
+    }
 
     /* 6. Create guard array for this function  */
     function_guard_array = create_function_guard_array(num_guards);

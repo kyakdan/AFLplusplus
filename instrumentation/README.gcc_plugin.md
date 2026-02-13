@@ -45,11 +45,11 @@ The idea and much of the implementation comes from Laszlo Szekeres.
 ## 2) How to use
 
 In order to leverage this mechanism, you need to have modern enough GCC (>=
-version 4.5.0) and the plugin development headers installed on your system. That
+version 5.0) and the plugin development headers installed on your system. That
 should be all you need. On Debian machines, these headers can be acquired by
-installing the `gcc-VERSION-plugin-dev` packages. If you're compiling a GCC 
-plugin that differs from the system-installed version and encounter issues 
-with version checks, you can use the `AFL_GCC_DISABLE_VERSION_CHECK` environment 
+installing the `gcc-VERSION-plugin-dev` packages. If you're compiling a GCC
+plugin that differs from the system-installed version and encounter issues
+with version checks, you can use the `AFL_GCC_DISABLE_VERSION_CHECK` environment
 variable.
 
 To build the instrumentation itself, type `make`. This will generate binaries
@@ -74,8 +74,20 @@ standard operating mode of AFL++, e.g.:
 Note: We also used `CXX` to set the C++ compiler to `afl-g++-fast` for C++ code.
 
 The tool honors some environmental variables of `afl-clang-fast` (see
-[docs/env_variables.md](../docs/env_variables.md). This includes
+[docs/env_variables.md](../docs/env_variables.md)). This includes
 `AFL_INST_RATIO`, `AFL_USE_ASAN`, `AFL_HARDEN`, and `AFL_DONT_OPTIMIZE`.
+The GCC plugin uses inline PC Guard instrumentation by default. Sampling via
+`AFL_INST_RATIO` (range `1-100`) is applied at runtime in
+`__sanitizer_cov_trace_pc_guard_init`. `AFL_GCC_OUT_OF_LINE` has been removed
+and is ignored with a warning.
+Set `AFL_GCC_ONLY_FSRV` to emit only the fork server without any coverage
+instrumentation (useful for debugging or baseline benchmarks). The old
+`AFL_GCC_ONLY_FRSV` spelling is deprecated and will be removed in a future
+release.
+For C++ inline/template functions emitted in multiple translation units, guard
+arrays are intentionally kept per-TU (no cross-TU weak coalescing). This avoids
+function/guard mismatches when different TUs produce different instrumentation
+shapes for the same COMDAT function.
 
 Note: if you want the GCC plugin to be installed on your system for all users,
 you need to build it before issuing 'make install' in the parent directory.
@@ -105,4 +117,3 @@ details, see [README.instrument_list.md](README.instrument_list.md).
 The gcc_plugin also support CMPLOG/Redqueen, just set `AFL_GCC_CMPLOG` before
 instrumenting the target.
 Read more about this in the llvm document.
-

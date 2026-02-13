@@ -108,9 +108,9 @@ CFLAGS/CXXFLAGS/CPPFLAGS.
 
 The tool supports a lot of environmental variables(see
 [docs/env_variables.md](../docs/env_variables.md)). This includes
-`AFL_USE_ASAN`, `AFL_HARDEN`, and `AFL_DONT_OPTIMIZE`. However, `AFL_INST_RATIO`
-is not honored as it does not serve a good purpose with the more effective
-PCGUARD analysis.
+`AFL_USE_ASAN`, `AFL_HARDEN`, and `AFL_DONT_OPTIMIZE`. `AFL_INST_RATIO` is
+honored by LLVM CLASSIC and by PCGUARD-based instrumentation (runtime sampling
+in `__sanitizer_cov_trace_pc_guard_init`, valid range `1-100`).
 
 ## 3) Options
 

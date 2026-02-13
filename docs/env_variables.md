@@ -72,18 +72,17 @@ fairly broad use of environment variables instead:
     `-fstack-protector-all`. The setting is useful for catching non-crashing
     memory bugs at the expense of a very slight (sub-5%) performance loss.
 
-  - Setting `AFL_INST_RATIO` to a percentage between 0 and 100 controls the
-    probability of instrumenting every branch. This is (very rarely) useful when
-    dealing with exceptionally complex programs that saturate the output bitmap.
-    Examples include ffmpeg, perl, and v8.
+  - Setting `AFL_INST_RATIO` to a percentage between 1 and 100 controls the
+    probability of enabling instrumentation for each edge / branch. This is
+    (very rarely) useful when dealing with exceptionally complex programs that
+    saturate the output bitmap. Examples include ffmpeg, perl, and v8.
 
     (If this ever happens, afl-fuzz will warn you ahead of the time by
     displaying the "bitmap density" field in fiery red.)
 
-    Setting `AFL_INST_RATIO` to 0 is a valid choice. This will instrument only
-    the transitions between function entry points, but not individual branches.
-
-    Note that this is an outdated variable. Only LLVM CLASSIC pass can use this.
+    For PCGUARD-based modes (LLVM PCGUARD and GCC plugin), sampling happens at
+    runtime in `__sanitizer_cov_trace_pc_guard_init`. For LLVM CLASSIC, sampling
+    is decided at compile time.
 
   - Setting `AFL_INPUT_PLACEHOLDER` to a string allows you to use that string 
     as a placeholder instead of "@@" in the target command line arguments.
@@ -132,12 +131,14 @@ fairly broad use of environment variables instead:
 ## 2) Settings for LLVM and LTO: afl-clang-fast / afl-clang-fast++ / afl-clang-lto / afl-clang-lto++
 
 The native instrumentation helpers (instrumentation and gcc_plugin) accept a
-subset of the settings discussed in section 1, with the exception of:
+subset of the settings discussed in section 1, with the following notes and
+exceptions:
 
   - `AFL_AS`, since this toolchain does not directly invoke GNU `as`.
 
-  - `AFL_INST_RATIO`, as we use collision free instrumentation by default. Not
-    all passes support this option though as it is an outdated feature.
+  - `AFL_INST_RATIO` is supported by LLVM CLASSIC and PCGUARD-based modes
+    (including GCC plugin). In PCGUARD modes it is applied at runtime. The
+    valid range is `1-100`.
 
   - LLVM modes support `AFL_LLVM_DICT2FILE=/absolute/path/file.txt` which will
     write all constant string comparisons to this file to be used later with
@@ -351,9 +352,8 @@ mode.
     version, resolving issues caused by version mismatches between GCC and
     the plugin.
 
-    Setting `AFL_GCC_OUT_OF_LINE=1` will instruct afl-gcc-fast to instrument the
-    code with calls to an injected subroutine instead of the much more efficient
-    inline instrumentation.
+    `AFL_GCC_OUT_OF_LINE` has been removed. The GCC plugin now always uses
+    inline PC Guard instrumentation. Setting it will produce a warning.
 
     Setting `AFL_GCC_SKIP_NEVERZERO=1` will not implement the skip zero test. If
     the target performs only a few loops, then this will give a small
