@@ -2179,7 +2179,7 @@ void add_native_pcguard(aflcc_state_t *aflcc) {
   if (aflcc->have_rust_asanrt) { return; }
   if (getenv("AFL_LLVM_ONLY_FSRV")) {
 
-    if (!be_quiet) { DEBUGF("SAND: Coverage instrumentation disabled\n"); }
+    if (!be_quiet) { DEBUGF("SANCOV: Coverage instrumentation disabled\n"); }
     return;
 
   }
@@ -2220,7 +2220,7 @@ void add_optimized_pcguard(aflcc_state_t *aflcc) {
 
   if (getenv("AFL_LLVM_ONLY_FSRV")) {
 
-    if (!be_quiet) { DEBUGF("SAND: Coverage instrumentation disabled\n"); }
+    if (!be_quiet) { DEBUGF("SANCOV: Coverage instrumentation disabled\n"); }
     return;
 
   }
@@ -2682,9 +2682,9 @@ void add_assembler(aflcc_state_t *aflcc) {
 /* Add params to launch the gcc plugins for instrumentation. */
 void add_gcc_plugin(aflcc_state_t *aflcc) {
 
-  if (getenv("AFL_GCC_ONLY_FSRV")) {
+  if (getenv("AFL_GCC_ONLY_FSRV") || getenv("AFL_GCC_ONLY_FRSV")) {
 
-    if (!be_quiet) { DEBUGF("SAND: Coverage instrumentation disabled\n"); }
+    if (!be_quiet) { DEBUGF("SANCOV: Coverage instrumentation disabled\n"); }
     return;
 
   }
@@ -3024,7 +3024,7 @@ static void maybe_usage(aflcc_state_t *aflcc, int argc, char **argv) {
         "      CLASSIC                           yes yes     yes    yes yes "
         "   yes\n"
         "  [GCC_PLUGIN] gcc plugin: %s%s\n"
-        "      CLASSIC              DEFAULT      no  yes     no     no  no     "
+        "      PCGUARD              DEFAULT      no  yes     no     no  yes    "
         "yes\n\n",
         aflcc->have_llvm ? "AVAILABLE   " : "unavailable!",
         aflcc->compiler_mode == LLVM ? " [SELECTED]" : "",
@@ -3113,7 +3113,8 @@ static void maybe_usage(aflcc_state_t *aflcc, int argc, char **argv) {
           "  AFL_PATH: path to instrumenting pass and runtime  "
           "(afl-compiler-rt.*o)\n"
           "  AFL_IGNORE_UNKNOWN_ENVS: don't warn on unknown env vars\n"
-          "  AFL_INST_RATIO: percentage of branches to instrument\n"
+          "  AFL_INST_RATIO: 1-100 percentage of branches/edges to instrument\n"
+          "                  (applied at runtime in PCGUARD modes)\n"
           "  AFL_QUIET: suppress verbose output\n"
           "  AFL_HARDEN: adds code hardening to catch memory bugs\n"
           "  AFL_USE_ASAN: activate address sanitizer\n"
@@ -3132,7 +3133,9 @@ static void maybe_usage(aflcc_state_t *aflcc, int argc, char **argv) {
             "  AFL_GCC_CMPLOG: log operands of comparisons (RedQueen mutator)\n"
             "  AFL_GCC_DISABLE_VERSION_CHECK: disable GCC plugin version "
             "control\n"
-            "  AFL_GCC_OUT_OF_LINE: disable inlined instrumentation\n"
+            "  AFL_GCC_ONLY_FSRV: emit forkserver only (disable coverage)\n"
+            "  AFL_GCC_ONLY_FRSV: deprecated alias for AFL_GCC_ONLY_FSRV\n"
+            "  AFL_GCC_OUT_OF_LINE: (removed, ignored with warning)\n"
             "  AFL_GCC_SKIP_NEVERZERO: do not skip zero on trace counters\n"
             "  AFL_GCC_INSTRUMENT_FILE: enable selective instrumentation by "
             "filename\n");
@@ -3939,4 +3942,3 @@ int main(int argc, char **argv, char **envp) {
   return 0;
 
 }
-
