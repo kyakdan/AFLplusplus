@@ -54,6 +54,8 @@
   #include "memmodel.h"
 #endif
 
+#include <set>
+
 /* This plugin, being under the same license as GCC, satisfies the
    "GPL-compatible Software" definition in the GCC RUNTIME LIBRARY
    EXCEPTION, so it can be part of an "Eligible" "Compilation
@@ -96,11 +98,16 @@ static inline bool is_artificial_static_ctor_dtor(const_tree decl) {
 
     if (!n) return false;
 
+    static const char *k_static_init =
+        "__static_initialization_and_destruction_";
+    static const char *k_static_init_mangled =
+        "_Z41__static_initialization_and_destruction_";
+
     return !strncmp(n, "_sub_I_", 7) || !strncmp(n, "_sub_D_", 7) ||
            !strncmp(n, "_GLOBAL__sub_I_", 15) ||
            !strncmp(n, "_GLOBAL__sub_D_", 15) ||
-           !strncmp(n, "__static_initialization_and_destruction_", 41) ||
-           !strncmp(n, "_Z41__static_initialization_and_destruction_", 45);
+           !strncmp(n, k_static_init, strlen(k_static_init)) ||
+           !strncmp(n, k_static_init_mangled, strlen(k_static_init_mangled));
 
   };
 
@@ -166,7 +173,7 @@ struct afl_pass : afl_base_pass {
      around to zero?  */
   const bool neverZero;
 
-  /* Count instrumented blocks (edges after splitting).  */
+  /* Count instrumented guard sites (edges + sub-block sites).  */
   unsigned int inst_blocks;
 
   /* Per-function guard array (set during execute()).  */
@@ -497,66 +504,476 @@ struct afl_pass : afl_base_pass {
 
   }
 
+  static inline bool is_truth_scalar_type(const_tree type) {
+
+    return type && INTEGRAL_TYPE_P(type) &&
+           TYPE_PRECISION(type) == 1;
+
+  }
+
+  static inline bool is_scalar_condition_type(const_tree type) {
+
+    return type && (INTEGRAL_TYPE_P(type) || POINTER_TYPE_P(type));
+
+  }
+
+  static inline bool is_comparison_code(enum tree_code code) {
+
+    switch (code) {
+
+      case EQ_EXPR:
+      case NE_EXPR:
+      case LT_EXPR:
+      case LE_EXPR:
+      case GT_EXPR:
+      case GE_EXPR:
+      case UNEQ_EXPR:
+      case UNLT_EXPR:
+      case UNLE_EXPR:
+      case UNGT_EXPR:
+      case UNGE_EXPR:
+      case LTGT_EXPR:
+      case UNORDERED_EXPR:
+      case ORDERED_EXPR:
+        return true;
+
+      default:
+        return false;
+
+    }
+
+  }
+
+  static inline bool has_prefix(const char *name, const char *prefix) {
+
+    if (!name || !prefix) return false;
+    return strncmp(name, prefix, strlen(prefix)) == 0;
+
+  }
+
+  /* LLVM's compare-site instrumentation skips comparisons that feed control
+     decisions (branches/switches/select conditions). Mirror that behavior in
+     GCC by walking boolean SSA uses transitively through simple bool ops. */
+  bool is_decision_use(tree value) {
+
+    if (!value || TREE_CODE(value) != SSA_NAME) return false;
+
+    auto_vec<tree> worklist;
+    std::set<tree> seen;
+    worklist.safe_push(value);
+
+    while (!worklist.is_empty()) {
+
+      tree current = worklist.pop();
+      if (!current || TREE_CODE(current) != SSA_NAME) continue;
+      if (!seen.insert(current).second) continue;
+
+      imm_use_iterator iter;
+      use_operand_p    use_p;
+      FOR_EACH_IMM_USE_FAST(use_p, iter, current) {
+
+        gimple use_stmt = USE_STMT(use_p);
+        if (!use_stmt) continue;
+
+        switch (gimple_code(use_stmt)) {
+
+          case GIMPLE_COND:
+            if (gimple_cond_lhs(as_a<gcond *>(use_stmt)) == current ||
+                gimple_cond_rhs(as_a<gcond *>(use_stmt)) == current)
+              return true;
+            break;
+
+          case GIMPLE_SWITCH:
+            if (gimple_switch_index(as_a<gswitch *>(use_stmt)) == current)
+              return true;
+            break;
+
+          case GIMPLE_ASSIGN: {
+
+            gassign *assign = as_a<gassign *>(use_stmt);
+            tree_code rhs_code = gimple_assign_rhs_code(assign);
+            if (rhs_code == COND_EXPR && gimple_assign_rhs1(assign) == current)
+              return true;
+
+            tree lhs = gimple_assign_lhs(assign);
+            if (!lhs || TREE_CODE(lhs) != SSA_NAME ||
+                !is_truth_scalar_type(TREE_TYPE(lhs)))
+              break;
+
+            bool uses_current =
+                (gimple_num_ops(assign) > 1 &&
+                 gimple_assign_rhs1(assign) == current) ||
+                (gimple_num_ops(assign) > 2 &&
+                 gimple_assign_rhs2(assign) == current) ||
+                (gimple_num_ops(assign) > 3 &&
+                 gimple_assign_rhs3(assign) == current);
+            if (!uses_current) break;
+
+            switch (rhs_code) {
+
+              case SSA_NAME:
+              case NOP_EXPR:
+              case CONVERT_EXPR:
+              case VIEW_CONVERT_EXPR:
+              case NON_LVALUE_EXPR:
+              case TRUTH_NOT_EXPR:
+              case BIT_NOT_EXPR:
+              case TRUTH_AND_EXPR:
+              case TRUTH_OR_EXPR:
+              case TRUTH_XOR_EXPR:
+              case BIT_AND_EXPR:
+              case BIT_IOR_EXPR:
+              case BIT_XOR_EXPR:
+                worklist.safe_push(lhs);
+                break;
+
+              default:
+                break;
+
+            }
+
+            break;
+
+          }
+
+          case GIMPLE_PHI: {
+
+            tree lhs = gimple_phi_result(as_a<gphi *>(use_stmt));
+            if (lhs && TREE_CODE(lhs) == SSA_NAME &&
+                is_truth_scalar_type(TREE_TYPE(lhs)))
+              worklist.safe_push(lhs);
+
+            break;
+
+          }
+
+          default:
+            break;
+
+        }
+
+      }
+
+    }
+
+    return false;
+
+  }
+
+  tree build_guard_ref(unsigned int guard_idx) {
+
+    return build4(ARRAY_REF, uint32_type_node, function_guard_array,
+                  build_int_cst(sizetype, guard_idx), NULL_TREE, NULL_TREE);
+
+  }
+
+  /* Emit map update sequence for a previously computed edge ID.  */
+  void append_map_increment_for_edge_id(gimple_seq *seq, tree edge_id) {
+
+    tree afl_area_ptr_decl = get_afl_area_ptr_decl();
+
+    /* Load map pointer (like LLVM - in every block/site).  */
+    tree map_ptr = create_tmp_var(TREE_TYPE(afl_area_ptr_decl), ".afl_map_ptr");
+    gimple_seq_add_stmt(seq, gimple_build_assign(map_ptr, afl_area_ptr_decl));
+
+    /* Compute map entry address: entry = map_ptr + edge_id.  */
+    tree edge_id_sized = create_tmp_var(sizetype, ".edge_id_sized");
+    gimple_seq_add_stmt(seq,
+                        gimple_build_assign(edge_id_sized, NOP_EXPR, edge_id));
+
+    tree entry = create_tmp_var(TREE_TYPE(map_ptr), ".afl_map_entry");
+    gimple_seq_add_stmt(
+        seq, gimple_build_assign(entry, POINTER_PLUS_EXPR, map_ptr, edge_id_sized));
+
+    /* Load counter, increment, store.  */
+    tree memref = build2(MEM_REF, unsigned_char_type_node, entry,
+                         build_zero_cst(TREE_TYPE(entry)));
+    tree counter = create_tmp_var(unsigned_char_type_node, ".afl_counter");
+    gimple_seq_add_stmt(seq, gimple_build_assign(counter, memref));
+
+    tree one = build_one_cst(unsigned_char_type_node);
+    gimple_seq_add_stmt(seq,
+                        gimple_build_assign(counter, PLUS_EXPR, counter, one));
+
+    if (neverZero) {
+
+      /* NeverZero: if counter wrapped to 0, set it to 1.
+         Same logic as LLVM: carry = (counter == 0); counter += carry.  */
+      tree zero = build_zero_cst(unsigned_char_type_node);
+      tree is_zero = create_tmp_var(boolean_type_node, ".is_zero");
+      gimple_seq_add_stmt(seq,
+                          gimple_build_assign(is_zero, EQ_EXPR, counter, zero));
+
+      tree carry = create_tmp_var(unsigned_char_type_node, ".carry");
+      gimple_seq_add_stmt(seq, gimple_build_assign(carry, NOP_EXPR, is_zero));
+
+      gimple_seq_add_stmt(seq,
+                          gimple_build_assign(counter, PLUS_EXPR, counter, carry));
+
+    }
+
+    gimple_seq_add_stmt(seq, gimple_build_assign(unshare_expr(memref), counter));
+
+  }
+
+  tree normalize_subblock_condition(gimple_seq *seq, tree condition) {
+
+    if (!condition) return NULL_TREE;
+
+    tree cond_expr = condition;
+    tree cond_type = TREE_TYPE(cond_expr);
+    if (!is_truth_scalar_type(cond_type)) {
+
+      if (!is_scalar_condition_type(cond_type)) return NULL_TREE;
+      tree zero = build_zero_cst(cond_type);
+      cond_expr = build2(NE_EXPR, boolean_type_node, cond_expr, zero);
+
+    }
+
+    if (!is_gimple_val(cond_expr)) {
+
+      tree tmp = create_tmp_var(boolean_type_node, ".afl_cond");
+      gimple_seq_add_stmt(seq, gimple_build_assign(tmp, cond_expr));
+      cond_expr = tmp;
+
+    }
+
+    return cond_expr;
+
+  }
+
+  bool get_subblock_condition_from_stmt(gimple stmt, tree *condition) {
+
+    if (!stmt || !condition) return false;
+
+    if (gimple_code(stmt) == GIMPLE_ASSIGN) {
+
+      gassign *assign = as_a<gassign *>(stmt);
+      tree_code rhs_code = gimple_assign_rhs_code(assign);
+
+      /* GCC equivalent of LLVM icmp/fcmp instructions in SSA.  */
+      if (is_comparison_code(rhs_code)) {
+
+        tree lhs = gimple_assign_lhs(assign);
+        if (!is_truth_scalar_type(TREE_TYPE(lhs))) return false;
+        if (is_decision_use(lhs)) return false;
+        *condition = lhs;
+        return true;
+
+      }
+
+      /* GCC equivalent of LLVM scalar select when represented as COND_EXPR.  */
+      if (rhs_code == COND_EXPR) {
+
+        tree cond = gimple_assign_rhs1(assign);
+        if (!is_scalar_condition_type(TREE_TYPE(cond))) return false;
+        *condition = cond;
+        return true;
+
+      }
+
+      return false;
+
+    }
+
+    if (gimple_code(stmt) != GIMPLE_CALL) return false;
+
+    tree lhs = gimple_call_lhs(stmt);
+    if (!lhs) return false;
+
+    tree lhs_type = TREE_TYPE(lhs);
+    if (!lhs_type) return false;
+
+    tree fndecl = gimple_call_fndecl(stmt);
+    if (!fndecl || !DECL_NAME(fndecl)) return false;
+
+    const char *fn_name = IDENTIFIER_POINTER(DECL_NAME(fndecl));
+    if (!fn_name) return false;
+
+    /* GCC equivalent of LLVM atomic cmpxchg: builtins that return success.  */
+    if (has_prefix(fn_name, "__atomic_compare_exchange") ||
+        has_prefix(fn_name, "__sync_bool_compare_and_swap")) {
+
+      if (!is_truth_scalar_type(lhs_type)) return false;
+      *condition = lhs;
+      return true;
+
+    }
+
+    /* __sync_val_compare_and_swap returns old value; success if old==expected. */
+    if (has_prefix(fn_name, "__sync_val_compare_and_swap")) {
+
+      if (gimple_call_num_args(stmt) < 2) return false;
+      tree expected = gimple_call_arg(stmt, 1);
+      expected = fold_convert_loc(UNKNOWN_LOCATION, lhs_type, expected);
+      *condition = build2(EQ_EXPR, boolean_type_node, lhs, expected);
+      return true;
+
+    }
+
+    /* GCC equivalent of LLVM atomicrmw min/max (when available).  */
+    if (has_prefix(fn_name, "__atomic_fetch_min") ||
+        has_prefix(fn_name, "__atomic_fetch_max")) {
+
+      if (gimple_call_num_args(stmt) < 2) return false;
+      tree new_val = gimple_call_arg(stmt, 1);
+      new_val = fold_convert_loc(UNKNOWN_LOCATION, lhs_type, new_val);
+
+      tree_code pred =
+          has_prefix(fn_name, "__atomic_fetch_min") ? LT_EXPR : GT_EXPR;
+      *condition = build2(pred, boolean_type_node, new_val, lhs);
+      return true;
+
+    }
+
+    return false;
+
+  }
+
+  bool should_scan_subblock_block(basic_block bb, function *fn) {
+
+    if (bb == ENTRY_BLOCK_PTR_FOR_FN(fn)) return false;
+    if (bb == EXIT_BLOCK_PTR_FOR_FN(fn)) return false;
+
+    gimple_stmt_iterator gsi = gsi_after_labels(bb);
+    if (gsi_end_p(gsi)) return false;
+
+    if (gimple_code(gsi_stmt(gsi)) == GIMPLE_CALL &&
+        gimple_call_builtin_p(gsi_stmt(gsi), BUILT_IN_UNREACHABLE))
+      return false;
+
+/* Apply the same coroutine block exclusion used for block instrumentation to
+   avoid GCC < 15 ICEs in EH-only dispatcher/resx blocks. */
+#if GCC_VERSION < 15000
+    if (fn->coroutine_component) {
+
+      for (gimple_stmt_iterator sub_gsi = gsi_start_bb(bb); !gsi_end_p(sub_gsi);
+           gsi_next(&sub_gsi)) {
+
+        gimple           stmt = gsi_stmt(sub_gsi);
+        enum gimple_code code = gimple_code(stmt);
+        if (code == GIMPLE_EH_DISPATCH || code == GIMPLE_RESX) return false;
+
+      }
+
+    }
+#endif
+
+    return true;
+
+  }
+
+  unsigned int count_subblock_sites(function *fn,
+                                    hash_set<basic_block> *subblock_blocks) {
+
+    unsigned int count = 0;
+    basic_block  bb;
+
+    FOR_EACH_BB_FN(bb, fn) {
+
+      if (!should_scan_subblock_block(bb, fn)) continue;
+
+      bool block_has_site = false;
+      for (gimple_stmt_iterator gsi = gsi_start_bb(bb); !gsi_end_p(gsi);
+           gsi_next(&gsi)) {
+
+        tree condition = NULL_TREE;
+        if (get_subblock_condition_from_stmt(gsi_stmt(gsi), &condition)) {
+
+          count++;
+          block_has_site = true;
+
+        }
+
+      }
+
+      if (block_has_site && subblock_blocks) subblock_blocks->add(bb);
+
+    }
+
+    return count;
+
+  }
+
+  bool insert_subblock_instrumentation(gimple_stmt_iterator *gsi, tree condition,
+                                       unsigned int guard_true_idx,
+                                       unsigned int guard_false_idx) {
+
+    gimple_seq seq = NULL;
+
+    tree cond_bool = normalize_subblock_condition(&seq, condition);
+    if (!cond_bool) return false;
+
+    tree guard_true = create_tmp_var(uint32_type_node, ".edge_true");
+    gimple_seq_add_stmt(&seq,
+                        gimple_build_assign(guard_true, build_guard_ref(guard_true_idx)));
+
+    tree guard_false = create_tmp_var(uint32_type_node, ".edge_false");
+    gimple_seq_add_stmt(
+        &seq, gimple_build_assign(guard_false, build_guard_ref(guard_false_idx)));
+
+    tree edge_id = create_tmp_var(uint32_type_node, ".edge_id");
+    tree cond_expr =
+        build3(COND_EXPR, uint32_type_node, cond_bool, guard_true, guard_false);
+    gimple_seq_add_stmt(&seq, gimple_build_assign(edge_id, cond_expr));
+
+    append_map_increment_for_edge_id(&seq, edge_id);
+
+    gsi_insert_seq_after(gsi, seq, GSI_SAME_STMT);
+    return true;
+
+  }
+
+  unsigned int instrument_subblock_sites(function *fn,
+                                         unsigned int first_guard_idx) {
+
+    unsigned int guard_idx = first_guard_idx;
+    basic_block  bb;
+
+    FOR_EACH_BB_FN(bb, fn) {
+
+      if (!should_scan_subblock_block(bb, fn)) continue;
+
+      gimple_stmt_iterator gsi = gsi_start_bb(bb);
+      while (!gsi_end_p(gsi)) {
+
+        gimple stmt = gsi_stmt(gsi);
+
+        /* Move first, so we don't re-process freshly inserted statements.  */
+        gimple_stmt_iterator here = gsi;
+        gsi_next(&gsi);
+
+        tree condition = NULL_TREE;
+        if (!get_subblock_condition_from_stmt(stmt, &condition)) continue;
+
+        if (insert_subblock_instrumentation(&here, condition, guard_idx,
+                                            guard_idx + 1))
+          guard_idx += 2;
+
+      }
+
+    }
+
+    return guard_idx - first_guard_idx;
+
+  }
+
   /* Insert guard-based instrumentation into a basic block.
      Matches LLVM's approach exactly:
        1. Load guard value (map index)
        2. Load map pointer (in every block - let optimizer hoist)
        3. GEP to map entry
-       4. Load counter, add 1, (NeverZero: if zero add 1), store  */
+       4. Load counter, add 1, (NeverZero: if zero add 1), store.  */
   void insert_guard_instrumentation(basic_block bb, unsigned int guard_idx) {
 
     gimple_seq seq = NULL;
-    static tree afl_area_ptr_decl = get_afl_area_ptr_decl();
 
-    /* Load guard value: edge_id = guard_array[guard_idx]  */
-    tree guard_ref =
-        build4(ARRAY_REF, uint32_type_node, function_guard_array,
-               build_int_cst(sizetype, guard_idx), NULL_TREE, NULL_TREE);
     tree edge_id = create_tmp_var(uint32_type_node, ".edge_id");
-    gimple_seq_add_stmt(&seq, gimple_build_assign(edge_id, guard_ref));
+    gimple_seq_add_stmt(&seq,
+                        gimple_build_assign(edge_id, build_guard_ref(guard_idx)));
 
-    /* Load map pointer (like LLVM - in every block)  */
-    tree map_ptr = create_tmp_var(TREE_TYPE(afl_area_ptr_decl), ".afl_map_ptr");
-    gimple_seq_add_stmt(&seq, gimple_build_assign(map_ptr, afl_area_ptr_decl));
+    append_map_increment_for_edge_id(&seq, edge_id);
 
-    /* Compute map entry address: entry = map_ptr + edge_id  */
-    tree edge_id_sized = create_tmp_var(sizetype, ".edge_id_sized");
-    gimple_seq_add_stmt(
-        &seq, gimple_build_assign(edge_id_sized, NOP_EXPR, edge_id));
-
-    tree entry = create_tmp_var(TREE_TYPE(map_ptr), ".afl_map_entry");
-    gimple_seq_add_stmt(
-        &seq, gimple_build_assign(entry, POINTER_PLUS_EXPR, map_ptr, edge_id_sized));
-
-    /* Load counter, increment, store  */
-    tree memref = build2(MEM_REF, unsigned_char_type_node, entry,
-                         build_zero_cst(TREE_TYPE(entry)));
-    tree counter = create_tmp_var(unsigned_char_type_node, ".afl_counter");
-    gimple_seq_add_stmt(&seq, gimple_build_assign(counter, memref));
-
-    /* counter = counter + 1  */
-    tree one = build_one_cst(unsigned_char_type_node);
-    gimple_seq_add_stmt(&seq, gimple_build_assign(counter, PLUS_EXPR, counter, one));
-
-    if (neverZero) {
-
-      /* NeverZero: if counter wrapped to 0, set it to 1
-         Same logic as LLVM: carry = (counter == 0); counter += carry  */
-      tree zero = build_zero_cst(unsigned_char_type_node);
-      tree is_zero = create_tmp_var(boolean_type_node, ".is_zero");
-      gimple_seq_add_stmt(&seq, gimple_build_assign(is_zero, EQ_EXPR, counter, zero));
-
-      tree carry = create_tmp_var(unsigned_char_type_node, ".carry");
-      gimple_seq_add_stmt(&seq, gimple_build_assign(carry, NOP_EXPR, is_zero));
-
-      gimple_seq_add_stmt(&seq, gimple_build_assign(counter, PLUS_EXPR, counter, carry));
-
-    }
-
-    /* Store counter back  */
-    gimple_seq_add_stmt(&seq, gimple_build_assign(unshare_expr(memref), counter));
-
-    /* Insert at block start (after labels)  */
     gimple_stmt_iterator insp = gsi_after_labels(bb);
     gsi_insert_seq_before(&insp, seq, GSI_SAME_STMT);
 
@@ -590,10 +1007,16 @@ struct afl_pass : afl_base_pass {
     calculate_dominance_info(CDI_DOMINATORS);
     calculate_dominance_info(CDI_POST_DOMINATORS);
 
-    /* 4. Collect blocks to instrument (no CFG changes here)  */
+    /* 4. Count sub-block sites and identify which blocks contain them
+       (LLVM icmp/fcmp/select/cmpxchg/atomicrmw equivalents in GCC GIMPLE).  */
+    hash_set<basic_block> subblock_blocks;
+    unsigned int subblock_sites = count_subblock_sites(fn, &subblock_blocks);
+
+    /* 5. Collect blocks to instrument (no CFG changes here).  */
     auto_vec<basic_block>  blocks_to_instrument;
     hash_set<basic_block>  returns_twice_blocks;
     basic_block            bb;
+    unsigned int           skip_blocks = 0;
 
     FOR_EACH_BB_FN(bb, fn) {
 
@@ -603,10 +1026,15 @@ struct afl_pass : afl_base_pass {
 
       if (block_has_returns_twice(bb)) { returns_twice_blocks.add(bb); }
 
+      /* Like LLVM's skipInstrumentBlock: blocks already covered by sub-block
+         instrumentation do not need a separate block-level guard.  */
+      if (subblock_blocks.contains(bb)) skip_blocks++;
+
     }
 
-    /* 5. Early exit if nothing to instrument  */
-    unsigned int num_guards = blocks_to_instrument.length();
+    /* 6. Early exit if nothing to instrument.  */
+    unsigned int num_block_guards = blocks_to_instrument.length() - skip_blocks;
+    unsigned int num_guards = num_block_guards + (subblock_sites * 2);
     if (num_guards == 0) {
 
       /* split_pcguard_edges() above may have invalidated dominance data.
@@ -620,14 +1048,23 @@ struct afl_pass : afl_base_pass {
 
     }
 
-    /* 6. Create guard array for this function  */
+    /* 7. Create guard array for this function.  */
     function_guard_array = create_function_guard_array(num_guards);
 
-    /* 7. Instrument collected blocks  */
+    /* 8. Instrument sub-block compare/select sites first, then normal
+       block/edge sites. This avoids reprocessing synthetic compare statements
+       emitted by the block-level instrumentation itself. */
+    unsigned int subblock_guards =
+        instrument_subblock_sites(fn, num_block_guards);
+
+    /* 9. Instrument collected blocks.  */
     unsigned int guard_idx = 0;
     for (unsigned i = 0; i < blocks_to_instrument.length(); i++) {
 
       bb = blocks_to_instrument[i];
+
+      /* Skip blocks already covered by sub-block instrumentation.  */
+      if (subblock_blocks.contains(bb)) continue;
 
       /* Handle returns_twice blocks (setjmp) - create trampoline  */
       if (returns_twice_blocks.contains(bb)) {
@@ -671,7 +1108,7 @@ struct afl_pass : afl_base_pass {
 
     }
 
-    inst_blocks += guard_idx;
+    inst_blocks += guard_idx + subblock_guards;
 
     /* Free dominance info since we may have modified CFG  */
     if (dom_info_available_p(CDI_DOMINATORS))
@@ -697,7 +1134,7 @@ struct afl_pass : afl_base_pass {
       if (!self.inst_blocks)
         WARNF("No instrumentation targets found.");
       else
-        OKF("Instrumented %u edges (PC Guard mode, %s).", self.inst_blocks,
+        OKF("Instrumented %u guards (PC Guard mode, %s).", self.inst_blocks,
             getenv("AFL_HARDEN") ? G_("hardened") : G_("non-hardened"));
 
     }

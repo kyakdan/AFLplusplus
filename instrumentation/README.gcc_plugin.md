@@ -88,6 +88,9 @@ For C++ inline/template functions emitted in multiple translation units, guard
 arrays are intentionally kept per-TU (no cross-TU weak coalescing). This avoids
 function/guard mismatches when different TUs produce different instrumentation
 shapes for the same COMDAT function.
+In addition to edge sites, the pass also instruments sub-block decision sites
+for compare/select-like GIMPLE and atomic compare-exchange builtins (including
+`__sync_val_compare_and_swap` success/failure tracking).
 
 Note: if you want the GCC plugin to be installed on your system for all users,
 you need to build it before issuing 'make install' in the parent directory.
