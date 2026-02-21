@@ -620,7 +620,9 @@ u8 fuzz_one_original(afl_state_t *afl) {
 
   }
 
-  if (unlikely(afl->shm.cmplog_mode &&
+  /* cmplog_binary guards child-forkserver use; shm.cmplog_mode can be set by
+     VP inline mode without a CmpLog child process. */
+  if (unlikely(afl->cmplog_binary &&
                afl->queue_cur->colorized < afl->cmplog_lvl &&
                (u32)len <= afl->cmplog_max_filesize)) {
 
@@ -3882,7 +3884,9 @@ static u8 mopt_common_fuzzing(afl_state_t *afl, MOpt_globals_t MOpt_globals) {
 
   }
 
-  if (unlikely(afl->shm.cmplog_mode &&
+  /* Use cmplog_binary, not shm.cmplog_mode: VP inline mode may still allocate
+     cmp_map SHM while no CmpLog child forkserver exists. */
+  if (unlikely(afl->cmplog_binary &&
                afl->queue_cur->colorized < afl->cmplog_lvl &&
                (u32)len <= afl->cmplog_max_filesize)) {
 

@@ -756,8 +756,10 @@ void add_to_queue(afl_state_t *afl, u8 *fname, u32 len, u8 passed_det) {
 
   }
 
-  /* only redqueen currently uses is_ascii */
-  if (unlikely(afl->shm.cmplog_mode && !q->is_ascii)) {
+  /* only redqueen currently uses is_ascii.
+     Guard with cmplog_binary (child exists), because VP inline mode can set
+     shm.cmplog_mode without starting a CmpLog child forkserver. */
+  if (unlikely(afl->cmplog_binary && !q->is_ascii)) {
 
     q->is_ascii = check_if_text(afl, q);
 
