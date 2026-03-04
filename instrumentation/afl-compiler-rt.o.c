@@ -2814,13 +2814,11 @@ static inline uint128_t vp_mask_u128(uint128_t v, u8 bits) {
 #endif
 
 /* Runtime predicate gate.
-   TODO: Re-evaluate whether non-EQ/NE predicates improve signal quality enough
-   to justify enabling them for level-1 runtime profiling. */
+   Level-1 runtime VP currently accepts all predicate encodings. */
 static inline u8 vp_runtime_allow_predicate(u8 attr) {
 
-  /* Allow integer and floating-point EQ/NE only.
-     FP compares are encoded as base predicate + 8. */
-  return attr <= 1 || attr == 8 || attr == 9;
+  (void)attr;
+  return 1;
 
 }
 
