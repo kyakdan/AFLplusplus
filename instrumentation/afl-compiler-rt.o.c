@@ -2818,7 +2818,9 @@ static inline uint128_t vp_mask_u128(uint128_t v, u8 bits) {
    to justify enabling them for level-1 runtime profiling. */
 static inline u8 vp_runtime_allow_predicate(u8 attr) {
 
-  return attr <= 1;
+  /* Allow integer and floating-point EQ/NE only.
+     FP compares are encoded as base predicate + 8. */
+  return attr <= 1 || attr == 8 || attr == 9;
 
 }
 
