@@ -1202,10 +1202,30 @@ void sync_fuzzers(afl_state_t *afl) {
 
 u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
 
-  u8  needs_write = 0, fault = 0;
-  u32 orig_len = q->len;
-  u64 trim_start_us = get_cur_time_us();
+  u8               needs_write = 0, fault = 0;
+  u32              orig_len = q->len;
+  u64              trim_start_us = get_cur_time_us();
+  u8               needs_vp_guard = 0;
+  vp_trim_guard_t *vp_trim_guard = NULL;
   afl->bytes_trim_in += orig_len;
+
+  if (unlikely(afl->value_profile_active && q->vp_ref_cnt)) {
+
+    needs_vp_guard = 1;
+
+  }
+
+  if (unlikely(needs_vp_guard)) {
+
+    vp_trim_guard = vp_trim_guard_init(afl, q);
+    if (unlikely(!vp_trim_guard)) {
+
+      fault = 0;
+      goto abort_trimming;
+
+    }
+
+  }
 
   /* Custom mutator trimmer */
   if (afl->custom_mutators_count) {
@@ -1217,7 +1237,9 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
 
       if (el->afl_custom_trim) {
 
-        trimmed_case = trim_case_custom(afl, q, in_buf, el);
+        trimmed_case = trim_case_custom(
+            afl, q, in_buf, el, vp_trim_guard, vp_trim_guard_before_exec,
+            vp_trim_guard_preserved, vp_trim_guard_after_exec);
         custom_trimmed = true;
 
       }
@@ -1231,6 +1253,33 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
     }
 
     if (custom_trimmed) {
+
+      u8 had_vp_ref = q->vp_ref_cnt;
+      if (unlikely(afl->value_profile_active && had_vp_ref)) {
+
+        u8 *custom_buf = queue_testcase_get(afl, q);
+        if (vp_collect_signal_for_input(afl, custom_buf, q->len)) {
+
+          if (afl->value_profile_level == 2) { (void)vp_check_cmpmap(afl); }
+          vp_frontier_apply(afl, q);
+
+        }
+
+        if (had_vp_ref && q->vp_ref_cnt && q->len != orig_len) {
+
+          if (unlikely(vp_trim_guard)) {
+
+            vp_trim_guard_refresh_owner_cost(vp_trim_guard);
+
+          } else {
+
+            vp_trim_refresh_owner_cost(afl, q);
+
+          }
+
+        }
+
+      }
 
       fault = trimmed_case;
       goto abort_trimming;
@@ -1283,13 +1332,25 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
       u32 trim_avail = MIN(remove_len, q->len - remove_pos);
       u64 cksum;
 
+      if (unlikely(vp_trim_guard)) { vp_trim_guard_before_exec(vp_trim_guard); }
+
       write_with_gap(afl, in_buf, q->len, remove_pos, trim_avail);
 
       fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
 
       update_trim_time(afl, &trim_start_us);
 
-      if (afl->stop_soon || fault == FSRV_RUN_ERROR) { goto abort_trimming; }
+      if (afl->stop_soon || fault == FSRV_RUN_ERROR) {
+
+        if (unlikely(vp_trim_guard)) {
+
+          vp_trim_guard_after_exec(vp_trim_guard);
+
+        }
+
+        goto abort_trimming;
+
+      }
 
       /* Note that we don't keep track of crashes or hangs here; maybe TODO?
        */
@@ -1305,20 +1366,36 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
 
       if (cksum == q->exec_cksum) {
 
-        u32 move_tail = q->len - remove_pos - trim_avail;
+        u8 vp_ok = 1;
+        if (unlikely(vp_trim_guard)) {
 
-        q->len -= trim_avail;
-        len_p2 = next_pow2(q->len);
+          vp_ok = vp_trim_guard_preserved(vp_trim_guard, in_buf, q->len,
+                                          remove_pos, trim_avail);
 
-        memmove(in_buf + remove_pos, in_buf + remove_pos + trim_avail,
-                move_tail);
+        }
 
-        /* Let's save a clean trace, which will be needed by
-           update_bitmap_score once we're done with the trimming stuff. */
-        if (!needs_write) {
+        if (likely(vp_ok)) {
 
-          needs_write = 1;
-          memcpy(afl->clean_trace, afl->fsrv.trace_bits, afl->fsrv.map_size);
+          u32 move_tail = q->len - remove_pos - trim_avail;
+
+          q->len -= trim_avail;
+          len_p2 = next_pow2(q->len);
+
+          memmove(in_buf + remove_pos, in_buf + remove_pos + trim_avail,
+                  move_tail);
+
+          /* Let's save a clean trace, which will be needed by
+             update_bitmap_score once we're done with the trimming stuff. */
+          if (!needs_write) {
+
+            needs_write = 1;
+            memcpy(afl->clean_trace, afl->fsrv.trace_bits, afl->fsrv.map_size);
+
+          }
+
+        } else {
+
+          remove_pos += remove_len;
 
         }
 
@@ -1327,6 +1404,8 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
         remove_pos += remove_len;
 
       }
+
+      if (unlikely(vp_trim_guard)) { vp_trim_guard_after_exec(vp_trim_guard); }
 
       /* Since this can be slow, update the screen every now and then. */
       if (!(trim_exec++ % afl->stats_update_freq)) { show_stats(afl); }
@@ -1444,10 +1523,36 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
 
     memcpy(afl->fsrv.trace_bits, afl->clean_trace, afl->fsrv.map_size);
     update_bitmap_score(afl, q, true);
+    u8 had_vp_ref = q->vp_ref_cnt;
+    if (unlikely(afl->value_profile_active && had_vp_ref)) {
+
+      if (vp_collect_signal_for_input(afl, in_buf, q->len)) {
+
+        if (afl->value_profile_level == 2) { (void)vp_check_cmpmap(afl); }
+        vp_frontier_apply(afl, q);
+
+      }
+
+      if (had_vp_ref && q->vp_ref_cnt) {
+
+        if (unlikely(vp_trim_guard)) {
+
+          vp_trim_guard_refresh_owner_cost(vp_trim_guard);
+
+        } else {
+
+          vp_trim_refresh_owner_cost(afl, q);
+
+        }
+
+      }
+
+    }
 
   }
 
 abort_trimming:
+  if (unlikely(vp_trim_guard)) { vp_trim_guard_destroy(vp_trim_guard); }
   afl->bytes_trim_out += q->len;
   update_trim_time(afl, &trim_start_us);
 

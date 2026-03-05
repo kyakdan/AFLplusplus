@@ -614,6 +614,13 @@ static inline void vp_dec_ref(afl_state_t *afl, struct queue_entry *q) {
   --q->vp_ref_cnt;
   if (!q->vp_ref_cnt) {
 
+    if (q->vp_trim_deferred) {
+
+      q->trim_done = 0;
+      q->vp_trim_deferred = 0;
+
+    }
+
     q->vp_last_ref_cycle = afl->queue_cycle;
     vp_maybe_disable_entry(afl, q);
 
@@ -1035,6 +1042,475 @@ static inline u8 vp_apply_site_candidates(afl_state_t        *afl,
 
 }
 
+typedef struct {
+
+  u32 site;
+  u32 max_dist;
+  u16 tag;
+  u16 need;
+  u16 seen;
+
+} vp_trim_req_t;
+
+struct vp_trim_guard {
+
+  afl_state_t        *afl;
+  struct queue_entry *q;
+  u8                  source;
+  u8                  active;
+  u8                  runtime_sandboxed;
+  u16                 slots;
+  vp_trim_req_t      *req;
+  u32                 req_cnt;
+  u32                 req_cap;
+  u32                *site_ids;
+  u32                 site_cnt;
+  u32                 site_cap;
+  size_t             *owned_idx;
+  u32                 owned_cnt;
+  u32                 owned_cap;
+  vp_site_t          *site_backup;
+  u8                 *child_buf;
+  u32                 child_cap;
+
+};
+
+static inline void vp_trim_guard_destroy_req(vp_trim_guard_t *guard) {
+
+  if (!guard) return;
+  if (guard->req) { ck_free(guard->req); }
+  if (guard->site_ids) { ck_free(guard->site_ids); }
+  if (guard->owned_idx) { ck_free(guard->owned_idx); }
+  if (guard->site_backup) { ck_free(guard->site_backup); }
+  if (guard->child_buf) { ck_free(guard->child_buf); }
+  ck_free(guard);
+
+}
+
+static inline void vp_trim_guard_add_site(vp_trim_guard_t *guard, u32 site) {
+
+  if (guard->site_cnt == guard->site_cap) {
+
+    u32 new_cap = guard->site_cap ? guard->site_cap << 1 : 8;
+    guard->site_ids = ck_realloc(guard->site_ids, new_cap * sizeof(u32));
+    guard->site_cap = new_cap;
+
+  }
+
+  guard->site_ids[guard->site_cnt++] = site;
+
+}
+
+static inline void vp_trim_guard_add_req(vp_trim_guard_t *guard, u32 site,
+                                         u32 site_req_start, u16 tag,
+                                         u32 max_dist) {
+
+  for (u32 i = site_req_start; i < guard->req_cnt; ++i) {
+
+    vp_trim_req_t *r = &guard->req[i];
+    if (r->tag == tag && r->max_dist == max_dist) {
+
+      if (r->need < 0xffffU) { ++r->need; }
+      return;
+
+    }
+
+  }
+
+  if (guard->req_cnt == guard->req_cap) {
+
+    u32 new_cap = guard->req_cap ? guard->req_cap << 1 : 8;
+    guard->req = ck_realloc(guard->req, new_cap * sizeof(vp_trim_req_t));
+    guard->req_cap = new_cap;
+
+  }
+
+  vp_trim_req_t *r = &guard->req[guard->req_cnt++];
+  r->site = site;
+  r->tag = tag;
+  r->max_dist = max_dist;
+  r->need = 1;
+  r->seen = 0;
+
+}
+
+static inline void vp_trim_guard_add_owned(vp_trim_guard_t *guard, size_t idx) {
+
+  if (guard->owned_cnt == guard->owned_cap) {
+
+    u32 new_cap = guard->owned_cap ? guard->owned_cap << 1 : 8;
+    guard->owned_idx = ck_realloc(guard->owned_idx, new_cap * sizeof(size_t));
+    guard->owned_cap = new_cap;
+
+  }
+
+  guard->owned_idx[guard->owned_cnt++] = idx;
+
+}
+
+static inline void vp_trim_guard_reset_seen(vp_trim_guard_t *guard) {
+
+  for (u32 i = 0; i < guard->req_cnt; ++i) {
+
+    guard->req[i].seen = 0;
+
+  }
+
+}
+
+static inline u8 vp_trim_guard_all_seen(const vp_trim_guard_t *guard) {
+
+  for (u32 i = 0; i < guard->req_cnt; ++i) {
+
+    if (guard->req[i].seen < guard->req[i].need) return 0;
+
+  }
+
+  return 1;
+
+}
+
+/* Assign one observed (site,tag,dist) candidate to the strictest unsatisfied
+   guarded requirement that it can satisfy. */
+static inline void vp_trim_guard_assign_candidate(vp_trim_guard_t *guard,
+                                                  u32 site, u16 tag, u32 dist) {
+
+  s32 best = -1;
+  u32 best_max_dist = ~(u32)0;
+
+  for (u32 i = 0; i < guard->req_cnt; ++i) {
+
+    vp_trim_req_t *r = &guard->req[i];
+    if (r->site != site || r->tag != tag || r->seen >= r->need ||
+        dist > r->max_dist)
+      continue;
+
+    if (best < 0 || r->max_dist < best_max_dist) {
+
+      best = (s32)i;
+      best_max_dist = r->max_dist;
+
+    }
+
+  }
+
+  if (best >= 0) { ++guard->req[best].seen; }
+
+}
+
+static inline u8 vp_trim_guard_eval_runtime(vp_trim_guard_t *guard) {
+
+  afl_state_t *afl = guard->afl;
+  vp_map_t    *vp = afl->shm.vp_map;
+  if (unlikely(!vp || !vp->enabled)) return 0;
+
+  u16 active_mask = vp_active_slot_mask((u16)afl->value_profile_slots);
+  for (u32 i = 0; i < guard->site_cnt; ++i) {
+
+    u32                 site_id = guard->site_ids[i];
+    vp_site_candidate_t candidates[VP_MAX_SLOTS];
+    u32                 cand_count = vp_collect_runtime_site_candidates(
+        &vp->site[site_id], active_mask, candidates, VP_MAX_SLOTS);
+
+    for (u32 j = 0; j < cand_count; ++j) {
+
+      vp_trim_guard_assign_candidate(guard, site_id, candidates[j].tag,
+                                     candidates[j].dist);
+
+    }
+
+  }
+
+  return vp_trim_guard_all_seen(guard);
+
+}
+
+static inline u8 vp_trim_guard_eval_cmplog(vp_trim_guard_t *guard) {
+
+  struct cmp_map *cmp = guard->afl->shm.cmp_map;
+  if (unlikely(!cmp)) return 0;
+
+  for (u32 i = 0; i < guard->site_cnt; ++i) {
+
+    u32                 site_id = guard->site_ids[i];
+    vp_site_candidate_t candidates[CMP_MAP_H];
+    u32                 cand_count =
+        vp_collect_cmplog_site_candidates(cmp, site_id, candidates, CMP_MAP_H);
+
+    for (u32 j = 0; j < cand_count; ++j) {
+
+      vp_trim_guard_assign_candidate(guard, site_id, candidates[j].tag,
+                                     candidates[j].dist);
+
+    }
+
+  }
+
+  return vp_trim_guard_all_seen(guard);
+
+}
+
+vp_trim_guard_t *vp_trim_guard_init(afl_state_t *afl, struct queue_entry *q) {
+
+  if (unlikely(!afl || !q || !afl->vp_frontier || !afl->value_profile_active ||
+               !q->vp_ref_cnt))
+    return NULL;
+
+  if (afl->value_profile_source != VP_SOURCE_RUNTIME_SHM &&
+      afl->value_profile_source != VP_SOURCE_CMPLOG_INLINE &&
+      afl->value_profile_source != VP_SOURCE_CMPLOG_CHILD)
+    return NULL;
+
+  vp_trim_guard_t *guard = ck_alloc(sizeof(vp_trim_guard_t));
+  guard->afl = afl;
+  guard->q = q;
+  guard->source = afl->value_profile_source;
+  guard->slots = (u16)afl->value_profile_slots;
+
+  u32 refs_left = q->vp_ref_cnt;
+  for (u32 site = 0; site < CMP_MAP_W && refs_left; ++site) {
+
+    size_t base = vp_site_base(afl, site);
+    u8     site_added = 0;
+    u32    site_req_start = guard->req_cnt;
+    for (u16 rel = 0; rel < guard->slots && refs_left; ++rel) {
+
+      vp_frontier_entry_t *entry = &afl->vp_frontier[base + rel];
+      if (entry->owner != q || entry->dist >= VP_DIST_UNSOLVED) continue;
+
+      if (!site_added) {
+
+        vp_trim_guard_add_site(guard, site);
+        site_added = 1;
+
+      }
+
+      vp_trim_guard_add_owned(guard, base + rel);
+      vp_trim_guard_add_req(guard, site, site_req_start, entry->tag,
+                            entry->dist);
+      --refs_left;
+
+    }
+
+  }
+
+  if (!guard->req_cnt) {
+
+    vp_trim_guard_destroy_req(guard);
+    return NULL;
+
+  }
+
+  if (guard->source == VP_SOURCE_RUNTIME_SHM && guard->site_cnt) {
+
+    guard->site_backup = ck_alloc(guard->site_cnt * sizeof(vp_site_t));
+
+  }
+
+  guard->active = 1;
+  return guard;
+
+}
+
+void vp_trim_guard_before_exec(vp_trim_guard_t *guard) {
+
+  if (unlikely(!guard || !guard->active)) return;
+  if (guard->source != VP_SOURCE_RUNTIME_SHM) return;
+
+  vp_map_t *vp = guard->afl->shm.vp_map;
+  if (unlikely(!vp || !vp->enabled || !guard->site_cnt || !guard->site_backup))
+    return;
+
+  for (u32 i = 0; i < guard->site_cnt; ++i) {
+
+    u32 site_id = guard->site_ids[i];
+    guard->site_backup[i] = vp->site[site_id];
+    memset(&vp->site[site_id], 0, sizeof(vp_site_t));
+    vp->site[site_id].exec_seen = vp->exec_id;
+
+  }
+
+  guard->runtime_sandboxed = 1;
+
+}
+
+u8 vp_trim_guard_preserved(vp_trim_guard_t *guard, u8 *in_buf, u32 cur_len,
+                           u32 remove_pos, u32 remove_len) {
+
+  if (unlikely(!guard || !guard->active || !guard->req_cnt)) return 1;
+  vp_trim_guard_reset_seen(guard);
+
+  switch (guard->source) {
+
+    case VP_SOURCE_RUNTIME_SHM:
+      return vp_trim_guard_eval_runtime(guard);
+
+    case VP_SOURCE_CMPLOG_INLINE:
+      return vp_trim_guard_eval_cmplog(guard);
+
+    case VP_SOURCE_CMPLOG_CHILD: {
+
+      if (unlikely(remove_len > cur_len)) return 0;
+      /* Custom mutator trimming passes a fully-trimmed buffer with
+         (remove_pos, remove_len) = (0, 0). Use it directly and avoid the
+         synthetic gap-copy path. */
+      if (!remove_pos && !remove_len) {
+
+        if (!vp_run_cmplog(guard->afl, in_buf, cur_len)) return 0;
+        return vp_trim_guard_eval_cmplog(guard);
+
+      }
+
+      u32 child_len = cur_len - remove_len;
+      if (guard->child_cap < child_len) {
+
+        guard->child_buf = ck_realloc(guard->child_buf, child_len);
+        guard->child_cap = child_len;
+
+      }
+
+      if (remove_pos) memcpy(guard->child_buf, in_buf, remove_pos);
+      u32 tail_len = cur_len - remove_pos - remove_len;
+      if (tail_len) {
+
+        memcpy(guard->child_buf + remove_pos, in_buf + remove_pos + remove_len,
+               tail_len);
+
+      }
+
+      if (!vp_run_cmplog(guard->afl, guard->child_buf, child_len)) return 0;
+      return vp_trim_guard_eval_cmplog(guard);
+
+    }
+
+    default:
+      return 0;
+
+  }
+
+}
+
+void vp_trim_guard_after_exec(vp_trim_guard_t *guard) {
+
+  if (unlikely(!guard || !guard->active)) return;
+  if (guard->source != VP_SOURCE_RUNTIME_SHM || !guard->runtime_sandboxed)
+    return;
+
+  vp_map_t *vp = guard->afl->shm.vp_map;
+  if (unlikely(!vp || !guard->site_backup)) {
+
+    guard->runtime_sandboxed = 0;
+    return;
+
+  }
+
+  for (u32 i = 0; i < guard->site_cnt; ++i) {
+
+    vp->site[guard->site_ids[i]] = guard->site_backup[i];
+
+  }
+
+  guard->runtime_sandboxed = 0;
+
+}
+
+void vp_trim_guard_refresh_owner_cost(vp_trim_guard_t *guard) {
+
+  if (unlikely(!guard || !guard->active || !guard->afl || !guard->q ||
+               !guard->afl->vp_frontier || !guard->owned_cnt ||
+               !guard->q->vp_ref_cnt))
+    return;
+
+  afl_state_t        *afl = guard->afl;
+  struct queue_entry *q = guard->q;
+  u64                 owner_cost = vp_entry_cost(q);
+  u32                 slots = afl->value_profile_slots;
+
+  s32 last_site = -1;
+  u8  site_touched = 0;
+  for (u32 i = 0; i < guard->owned_cnt; ++i) {
+
+    size_t idx = guard->owned_idx[i];
+    u32    site = (u32)(idx / slots);
+    /* vp_trim_guard_init() populates owned_idx in site-ascending order.
+       If this invariant changes, fall back to full owner-cost refresh. */
+    if (unlikely(last_site >= 0 && site < (u32)last_site)) {
+
+      vp_trim_refresh_owner_cost(afl, q);
+      return;
+
+    }
+
+    if ((s32)site != last_site && last_site >= 0) {
+
+      if (site_touched) { vp_refresh_site_winner(afl, (u32)last_site); }
+      site_touched = 0;
+
+    }
+
+    vp_frontier_entry_t *entry = &afl->vp_frontier[idx];
+    if (entry->owner == q && entry->dist < VP_DIST_UNSOLVED &&
+        entry->cost != owner_cost) {
+
+      entry->cost = owner_cost;
+      site_touched = 1;
+
+    }
+
+    last_site = (s32)site;
+
+  }
+
+  if (last_site >= 0 && site_touched) {
+
+    vp_refresh_site_winner(afl, (u32)last_site);
+
+  }
+
+}
+
+void vp_trim_guard_destroy(vp_trim_guard_t *guard) {
+
+  if (!guard) return;
+  vp_trim_guard_after_exec(guard);
+  vp_trim_guard_destroy_req(guard);
+
+}
+
+void vp_trim_refresh_owner_cost(afl_state_t *afl, struct queue_entry *q) {
+
+  if (unlikely(!afl || !q || !afl->vp_frontier || !q->vp_ref_cnt)) return;
+
+  u64 owner_cost = vp_entry_cost(q);
+  u32 refs_left = q->vp_ref_cnt;
+  u16 slots = (u16)afl->value_profile_slots;
+
+  for (u32 site = 0; site < CMP_MAP_W && refs_left; ++site) {
+
+    size_t base = vp_site_base(afl, site);
+    u8     site_touched = 0;
+    for (u16 rel = 0; rel < slots && refs_left; ++rel) {
+
+      vp_frontier_entry_t *entry = &afl->vp_frontier[base + rel];
+      if (entry->owner != q || entry->dist >= VP_DIST_UNSOLVED) continue;
+
+      if (entry->cost != owner_cost) {
+
+        entry->cost = owner_cost;
+        site_touched = 1;
+
+      }
+
+      --refs_left;
+
+    }
+
+    if (site_touched) { vp_refresh_site_winner(afl, site); }
+
+  }
+
+}
+
 /* Fast VP-interest probe used before queue admission.
    Admission is based on distance-only progress; cost tie-breaks are applied
    later in vp_frontier_apply() after calibration provides real exec_us. */
@@ -1199,10 +1675,12 @@ void vp_apply_delayed_evictions(afl_state_t *afl) {
 
 }
 
-/* Collect VP signal for one replayed queue entry.
+/* Collect VP signal for one concrete input using the active VP source.
    For child-CmpLog source, run only the CmpLog child to avoid double-running
    the input. For runtime/inline sources, run the main target once first. */
-static inline u8 vp_replay_collect_signal(afl_state_t *afl, u8 *mem, u32 len) {
+u8 vp_collect_signal_for_input(afl_state_t *afl, u8 *mem, u32 len) {
+
+  if (unlikely(!afl->value_profile_active)) return 0;
 
   if (afl->value_profile_source == VP_SOURCE_CMPLOG_CHILD) {
 
@@ -1253,7 +1731,7 @@ static void vp_replay_queue(afl_state_t *afl) {
     if (unlikely(!q || q->disabled || !q->len)) continue;
 
     u8 *mem = queue_testcase_get(afl, q);
-    if (!vp_replay_collect_signal(afl, mem, q->len)) continue;
+    if (!vp_collect_signal_for_input(afl, mem, q->len)) continue;
 
     if (afl->value_profile_level == 2) { (void)vp_check_cmpmap(afl); }
     vp_frontier_apply_with_cost(afl, q, vp_entry_cost(q));

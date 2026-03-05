@@ -272,6 +272,7 @@ struct queue_entry {
   u32 vp_ref_cnt;                       /* Number of owned VP frontier slots*/
 
   bool trim_done,                       /* Trimmed?                         */
+      vp_trim_deferred,                 /* VP-owner trim deferred?          */
       was_fuzzed,                       /* historical, but needed for MOpt  */
       passed_det,                       /* Deterministic stages passed?     */
       has_new_cov,                      /* Triggers new coverage?           */
@@ -331,6 +332,8 @@ typedef struct {
   u16                 tag;             /* Frontier tag                      */
 
 } vp_frontier_entry_t;
+
+typedef struct vp_trim_guard vp_trim_guard_t;
 
 struct extra_data {
 
@@ -1301,7 +1304,11 @@ void read_afl_environment(afl_state_t *, char **);
 void setup_custom_mutators(afl_state_t *);
 void destroy_custom_mutators(afl_state_t *);
 u8   trim_case_custom(afl_state_t *, struct queue_entry *q, u8 *in_buf,
-                      struct custom_mutator *mutator);
+                      struct custom_mutator *mutator,
+                      vp_trim_guard_t       *vp_trim_guard,
+                      void (*vp_before_exec)(vp_trim_guard_t *),
+                      u8 (*vp_preserved)(vp_trim_guard_t *, u8 *, u32, u32, u32),
+                      void (*vp_after_exec)(vp_trim_guard_t *));
 void run_afl_custom_queue_new_entry(afl_state_t *, struct queue_entry *, u8 *,
                                     u8 *);
 
@@ -1377,7 +1384,15 @@ void vp_update_activation(afl_state_t *);
 void vp_frontier_apply(afl_state_t *, struct queue_entry *);
 void vp_frontier_apply_with_cost(afl_state_t *, struct queue_entry *, u64);
 u8   vp_frontier_would_improve(afl_state_t *);
+vp_trim_guard_t *vp_trim_guard_init(afl_state_t *, struct queue_entry *);
+void             vp_trim_guard_before_exec(vp_trim_guard_t *);
+u8   vp_trim_guard_preserved(vp_trim_guard_t *, u8 *, u32, u32, u32);
+void vp_trim_guard_after_exec(vp_trim_guard_t *);
+void vp_trim_guard_refresh_owner_cost(vp_trim_guard_t *);
+void vp_trim_guard_destroy(vp_trim_guard_t *);
+void vp_trim_refresh_owner_cost(afl_state_t *, struct queue_entry *);
 void vp_apply_delayed_evictions(afl_state_t *);
+u8   vp_collect_signal_for_input(afl_state_t *, u8 *, u32);
 u8   vp_run_cmplog(afl_state_t *, void *, u32);
 u8   vp_ensure_cmp_data_ready(afl_state_t *, void *, u32);
 void vp_prepare_exec(afl_state_t *, afl_forkserver_t *);

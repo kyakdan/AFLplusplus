@@ -451,7 +451,11 @@ struct custom_mutator *load_custom_mutator(afl_state_t *afl, const char *fn) {
 }
 
 u8 trim_case_custom(afl_state_t *afl, struct queue_entry *q, u8 *in_buf,
-                    struct custom_mutator *mutator) {
+                    struct custom_mutator *mutator,
+                    vp_trim_guard_t       *vp_trim_guard,
+                    void (*vp_before_exec)(vp_trim_guard_t *),
+                    u8 (*vp_preserved)(vp_trim_guard_t *, u8 *, u32, u32, u32),
+                    void (*vp_after_exec)(vp_trim_guard_t *)) {
 
   u8  fault = 0;
   u32 trim_exec = 0;
@@ -486,6 +490,7 @@ u8 trim_case_custom(afl_state_t *afl, struct queue_entry *q, u8 *in_buf,
   while (afl->stage_cur < afl->stage_max) {
 
     u8 *retbuf = NULL;
+    u8  vp_ok = 1;
 
     sprintf(afl->stage_name_buf, "ptrim %s",
             u_stringify_int(val_buf, trim_exec));
@@ -538,19 +543,46 @@ u8 trim_case_custom(afl_state_t *afl, struct queue_entry *q, u8 *in_buf,
 
       } else {
 
+        if (unlikely(vp_trim_guard && vp_before_exec)) {
+
+          vp_before_exec(vp_trim_guard);
+
+        }
+
         fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
         ++afl->trim_execs;
 
-        if (afl->stop_soon || fault == FSRV_RUN_ERROR) { goto abort_trimming; }
+        if (afl->stop_soon || fault == FSRV_RUN_ERROR) {
+
+          if (unlikely(vp_trim_guard && vp_after_exec)) {
+
+            vp_after_exec(vp_trim_guard);
+
+          }
+
+          goto abort_trimming;
+
+        }
 
         classify_counts(&afl->fsrv);
         cksum = hash64(afl->fsrv.trace_bits, afl->fsrv.map_size, HASH_CONST);
+        if (cksum == q->exec_cksum && unlikely(vp_trim_guard && vp_preserved)) {
+
+          vp_ok = vp_preserved(vp_trim_guard, retbuf, (u32)retlen, 0, 0);
+
+        }
 
       }
 
     }
 
-    if (likely(retlen && cksum == q->exec_cksum)) {
+    if (unlikely(vp_trim_guard && retlen && vp_after_exec)) {
+
+      vp_after_exec(vp_trim_guard);
+
+    }
+
+    if (likely(retlen && cksum == q->exec_cksum && vp_ok)) {
 
       /* Let's save a clean trace, which will be needed by
          update_bitmap_score once we're done with the trimming stuff.
