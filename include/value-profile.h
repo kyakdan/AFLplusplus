@@ -32,7 +32,7 @@
 
 typedef struct {
 
-  u16 slot_key;               /* Per-exec hit ordinal tag (saturating)      */
+  u16 slot_key;               /* Per-exec hit/metric tag (saturating)       */
   u16 best_dist;               /* Best distance for slot_key (0 == solved)  */
 
 } vp_slot_t;

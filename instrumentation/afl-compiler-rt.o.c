@@ -2883,11 +2883,11 @@ static inline vp_site_t *vp_runtime_prepare_site(vp_map_t *vp, u16 site_id) {
 
 }
 
-/* Select the slot to update for one hit:
+/* Select the slot to update for one tagged distance:
    matching active slot > empty slot > solved active slot > strictly-better
    replacement of worst active slot. */
 static inline s32 vp_runtime_pick_slot(vp_site_t *site, u16 slot_count,
-                                       u16 hit_ordinal, u16 distance,
+                                       u16 slot_key, u16 distance,
                                        u16 preferred_start_slot) {
 
   u16 active_slot_mask = site->valid_mask & vp_runtime_site_mask(slot_count);
@@ -2907,7 +2907,7 @@ static inline s32 vp_runtime_pick_slot(vp_site_t *site, u16 slot_count,
     if (vp_slot_is_active(active_slot_mask, slot_idx)) {
 
       u16 slot_dist = site->slots[slot_idx].best_dist;
-      if (site->slots[slot_idx].slot_key == hit_ordinal) {
+      if (site->slots[slot_idx].slot_key == slot_key) {
 
         return distance < slot_dist ? (s32)slot_idx : -1;
 
@@ -2944,6 +2944,32 @@ static inline s32 vp_runtime_pick_slot(vp_site_t *site, u16 slot_count,
 
 }
 
+static inline void vp_runtime_store_dist(vp_map_t *vp, u16 site_id,
+                                         vp_site_t *site, u16 slot_count,
+                                         u16 slot_key, u16 dist,
+                                         u16 preferred_start_slot) {
+
+  s32 selected_slot_idx = vp_runtime_pick_slot(site, slot_count, slot_key, dist,
+                                               preferred_start_slot);
+  if (selected_slot_idx < 0) return;
+
+  if (!site->touched_mask) { vp_runtime_append_control(vp, site_id); }
+
+  site->slots[selected_slot_idx].slot_key = slot_key;
+  site->slots[selected_slot_idx].best_dist = dist;
+  u16 selected_slot_bit = (u16)(1U << selected_slot_idx);
+  site->valid_mask |= selected_slot_bit;
+  site->touched_mask |= selected_slot_bit;
+
+}
+
+static inline u16 vp_runtime_metric_key(u16 hit_ordinal, u8 metric_id) {
+
+  u16 capped_hit_ordinal = MIN(hit_ordinal, (u16)0x7fff);
+  return (u16)((capped_hit_ordinal << 1) | (metric_id & 1U));
+
+}
+
 /* Record one computed distance for a callsite into the runtime VP map. */
 static inline void vp_runtime_record_dist(u16 site_id, u16 dist) {
 
@@ -2957,17 +2983,40 @@ static inline void vp_runtime_record_dist(u16 site_id, u16 dist) {
 
   u16 preferred_start_slot =
       slot_count == 1 ? 0 : (u16)(hit_ordinal % slot_count);
-  s32 selected_slot_idx = vp_runtime_pick_slot(site, slot_count, hit_ordinal,
-                                               dist, preferred_start_slot);
-  if (selected_slot_idx < 0) return;
+  vp_runtime_store_dist(vp, site_id, site, slot_count, hit_ordinal, dist,
+                        preferred_start_slot);
 
-  if (!site->touched_mask) { vp_runtime_append_control(vp, site_id); }
+}
 
-  site->slots[selected_slot_idx].slot_key = hit_ordinal;
-  site->slots[selected_slot_idx].best_dist = dist;
-  u16 selected_slot_bit = (u16)(1U << selected_slot_idx);
-  site->valid_mask |= selected_slot_bit;
-  site->touched_mask |= selected_slot_bit;
+/* Scalar compares benefit from keeping bitwise and numeric gradients
+   independent. This avoids low-hamming but numerically distant values
+   crowding out inputs that actually reduce the absolute difference. */
+static inline void vp_runtime_record_scalar_dists(u16 site_id, u16 hamming_dist,
+                                                  u16 abs_dist) {
+
+  vp_map_t *vp = __afl_vp_map;
+  if (likely(!vp || !vp->enabled)) return;
+
+  u16        slot_count = __afl_vp_slots;
+  vp_site_t *site = vp_runtime_prepare_site(vp, site_id);
+  u16        hit_ordinal = site->hit_count;
+  if (site->hit_count < 0xffffU) { ++site->hit_count; }
+
+  u16 preferred_start_slot =
+      slot_count == 1 ? 0 : (u16)(hit_ordinal % slot_count);
+  vp_runtime_store_dist(vp, site_id, site, slot_count,
+                        vp_runtime_metric_key(hit_ordinal, 0), hamming_dist,
+                        preferred_start_slot);
+
+  /* Always materialize both scalar metrics for this hit.
+     If abs_dist == hamming_dist (including solved compares: 0,0), skipping the
+     second metric would leave stale slot state from previous executions and
+     mislead frontier ranking toward already-solved earlier hits. */
+  u16 next_start_slot =
+      slot_count == 1 ? 0 : (u16)((preferred_start_slot + 1U) % slot_count);
+  vp_runtime_store_dist(vp, site_id, site, slot_count,
+                        vp_runtime_metric_key(hit_ordinal, 1), abs_dist,
+                        next_start_slot);
 
 }
 
@@ -2976,21 +3025,18 @@ void __valueprofile_hook2(uint16_t arg1, uint16_t arg2, uint8_t attr) {
   if (likely(!__afl_vp_map || !__afl_vp_map->enabled)) return;
   if (unlikely(!vp_runtime_allow_predicate(attr))) return;
   u16 site = vp_runtime_hash_site();
-  u16 dist;
   if (arg1 == arg2) {
 
-    dist = 0;
+    vp_runtime_record_scalar_dists(site, 0, 0);
 
   } else {
 
     u32 hamming = popcount_u32((u32)(arg1 ^ arg2));
     u32 abs_dist =
         bit_length_u64((u64)((arg1 > arg2) ? (arg1 - arg2) : (arg2 - arg1)));
-    dist = (u16)MIN(hamming, abs_dist);
+    vp_runtime_record_scalar_dists(site, (u16)hamming, (u16)abs_dist);
 
   }
-
-  vp_runtime_record_dist(site, dist);
 
 }
 
@@ -2999,21 +3045,18 @@ void __valueprofile_hook4(uint32_t arg1, uint32_t arg2, uint8_t attr) {
   if (likely(!__afl_vp_map || !__afl_vp_map->enabled)) return;
   if (unlikely(!vp_runtime_allow_predicate(attr))) return;
   u16 site = vp_runtime_hash_site();
-  u16 dist;
   if (arg1 == arg2) {
 
-    dist = 0;
+    vp_runtime_record_scalar_dists(site, 0, 0);
 
   } else {
 
     u32 hamming = popcount_u32(arg1 ^ arg2);
     u32 abs_dist =
         bit_length_u64((u64)((arg1 > arg2) ? (arg1 - arg2) : (arg2 - arg1)));
-    dist = (u16)MIN(hamming, abs_dist);
+    vp_runtime_record_scalar_dists(site, (u16)hamming, (u16)abs_dist);
 
   }
-
-  vp_runtime_record_dist(site, dist);
 
 }
 
@@ -3022,21 +3065,18 @@ void __valueprofile_hook8(uint64_t arg1, uint64_t arg2, uint8_t attr) {
   if (likely(!__afl_vp_map || !__afl_vp_map->enabled)) return;
   if (unlikely(!vp_runtime_allow_predicate(attr))) return;
   u16 site = vp_runtime_hash_site();
-  u16 dist;
   if (arg1 == arg2) {
 
-    dist = 0;
+    vp_runtime_record_scalar_dists(site, 0, 0);
 
   } else {
 
     u32 hamming = popcount_u64(arg1 ^ arg2);
     u32 abs_dist =
         bit_length_u64((arg1 > arg2) ? (arg1 - arg2) : (arg2 - arg1));
-    dist = (u16)MIN(hamming, abs_dist);
+    vp_runtime_record_scalar_dists(site, (u16)hamming, (u16)abs_dist);
 
   }
-
-  vp_runtime_record_dist(site, dist);
 
 }
 
@@ -3050,21 +3090,18 @@ void __valueprofile_hook16(uint128_t arg1, uint128_t arg2, uint8_t attr) {
   arg1 = vp_mask_u128(arg1, 128);
   arg2 = vp_mask_u128(arg2, 128);
 
-  u16 dist;
   if (arg1 == arg2) {
 
-    dist = 0;
+    vp_runtime_record_scalar_dists(site, 0, 0);
 
   } else {
 
     u32       hamming = vp_popcnt_u128(arg1 ^ arg2);
     uint128_t abs_val = (arg1 > arg2) ? (arg1 - arg2) : (arg2 - arg1);
     u32       abs_dist = vp_bitlen_u128(abs_val);
-    dist = (u16)MIN(hamming, abs_dist);
+    vp_runtime_record_scalar_dists(site, (u16)hamming, (u16)abs_dist);
 
   }
-
-  vp_runtime_record_dist(site, dist);
 
 }
 
@@ -3081,21 +3118,18 @@ void __valueprofile_hookN(uint128_t arg1, uint128_t arg2, uint8_t attr,
   arg1 = vp_mask_u128(arg1, bits);
   arg2 = vp_mask_u128(arg2, bits);
 
-  u16 dist;
   if (arg1 == arg2) {
 
-    dist = 0;
+    vp_runtime_record_scalar_dists(site, 0, 0);
 
   } else {
 
     u32       hamming = vp_popcnt_u128(arg1 ^ arg2);
     uint128_t abs_val = (arg1 > arg2) ? (arg1 - arg2) : (arg2 - arg1);
     u32       abs_dist = vp_bitlen_u128(abs_val);
-    dist = (u16)MIN(hamming, abs_dist);
+    vp_runtime_record_scalar_dists(site, (u16)hamming, (u16)abs_dist);
 
   }
-
-  vp_runtime_record_dist(site, dist);
 
 }
 
@@ -3107,7 +3141,6 @@ void __valueprofile_hook_float(float arg1, float arg2, uint8_t attr) {
   if (unlikely(!vp_runtime_allow_predicate(attr))) return;
   if (isnan(arg1) || isnan(arg2)) return;
   u16 site = vp_runtime_hash_site();
-  u16 dist = 0;
 
   if (arg1 != arg2) {
 
@@ -3116,11 +3149,12 @@ void __valueprofile_hook_float(float arg1, float arg2, uint8_t attr) {
     memcpy((void *)&b1, (void *)&arg2, sizeof(b1));
     u32 hamming = popcount_u32(b0 ^ b1);
     u32 abs_dist = bit_length_u64((u64)((b0 > b1) ? (b0 - b1) : (b1 - b0)));
-    dist = (u16)MIN(hamming, abs_dist);
+    vp_runtime_record_scalar_dists(site, (u16)hamming, (u16)abs_dist);
+    return;
 
   }
 
-  vp_runtime_record_dist(site, dist);
+  vp_runtime_record_scalar_dists(site, 0, 0);
 
 }
 
@@ -3130,7 +3164,6 @@ void __valueprofile_hook_double(double arg1, double arg2, uint8_t attr) {
   if (unlikely(!vp_runtime_allow_predicate(attr))) return;
   if (isnan(arg1) || isnan(arg2)) return;
   u16 site = vp_runtime_hash_site();
-  u16 dist = 0;
 
   if (arg1 != arg2) {
 
@@ -3139,11 +3172,12 @@ void __valueprofile_hook_double(double arg1, double arg2, uint8_t attr) {
     memcpy((void *)&b1, (void *)&arg2, sizeof(b1));
     u32 hamming = popcount_u64(b0 ^ b1);
     u32 abs_dist = bit_length_u64((b0 > b1) ? (b0 - b1) : (b1 - b0));
-    dist = (u16)MIN(hamming, abs_dist);
+    vp_runtime_record_scalar_dists(site, (u16)hamming, (u16)abs_dist);
+    return;
 
   }
 
-  vp_runtime_record_dist(site, dist);
+  vp_runtime_record_scalar_dists(site, 0, 0);
 
 }
 
@@ -4487,4 +4521,3 @@ uint32_t ijon_memdist(char *a, char *b, size_t len) {
   }
 
 }
-
