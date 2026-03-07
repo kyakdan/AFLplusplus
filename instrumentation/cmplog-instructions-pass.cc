@@ -43,7 +43,6 @@
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Passes/OptimizationLevel.h"
 #include "llvm/Analysis/LoopInfo.h"
-
 #include "llvm/IR/Verifier.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/Support/raw_ostream.h"
@@ -62,7 +61,6 @@ static int vp_mode = 0;
 namespace {
 
 using LoopInfoCallback = function_ref<LoopInfo *(Function &F)>;
-
 class CmpLogInstructions : public PassInfoMixin<CmpLogInstructions> {
 
  public:
@@ -123,18 +121,19 @@ Iterator Unique(Iterator first, Iterator last) {
 }
 
 // Check if a compare instruction is a loop condition that should be skipped.
-// Returns true if the branch is part of loop control flow (latch, header, or
-// exiting block) for any containing loop.
+// Header and latch branches are still treated as loop control. We intentionally
+// no longer skip every loop-exiting block because semantic checks inside loop
+// bodies may also branch out of the loop on failure.
+// TODO: Replace this block-role heuristic with a more semantic check for
+// canonical loop-control compares if we find a robust low-noise formulation.
 static bool IsLoopCondition(BranchInst *BR, LoopInfo *LI) {
 
   BasicBlock *BranchBB = BR->getParent();
 
-  // Check all loops containing this block (innermost to outermost)
   for (Loop *L = LI->getLoopFor(BranchBB); L; L = L->getParentLoop()) {
 
     if (L->isLoopLatch(BranchBB)) return true;    // Back-edge source
     if (L->getHeader() == BranchBB) return true;  // Loop header condition
-    if (L->isLoopExiting(BranchBB)) return true;  // Loop exit condition
 
   }
 
@@ -266,7 +265,8 @@ bool CmpLogInstructions::hookInstrs(Module &M, LoopInfoCallback LICallback) {
         CmpInst *selectcmpInst = nullptr;
         if ((selectcmpInst = dyn_cast<CmpInst>(&IN))) {
 
-          // skip loop comparisons using LoopInfo for robust detection
+          // Skip obvious loop-control compares, but keep semantic checks inside
+          // loop bodies that happen to exit on failure.
           if (selectcmpInst->hasOneUse())
             if (auto BR = dyn_cast<BranchInst>(selectcmpInst->user_back()))
               if (IsLoopCondition(BR, LICallback(F))) continue;
