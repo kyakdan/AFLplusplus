@@ -43,7 +43,7 @@ typedef struct {
   u16       hit_count;      /* Next per-exec hit ordinal for this site      */
   u16       valid_mask;     /* Persistent occupancy: bit i => slots[i] valid*/
   u16       touched_mask;   /* Per-exec delta: bit i => slots[i] was updated*/
-  u16       reserved;         /* Reserved for alignment / future tiny flags */
+  u16       protected_mask; /* Persistent home-slot occupancy by key        */
   vp_slot_t slots[VP_MAX_SLOTS]; /* Persistent slot state across runs       */
 
 } vp_site_t;

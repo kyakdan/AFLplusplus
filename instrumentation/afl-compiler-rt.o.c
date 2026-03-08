@@ -2883,33 +2883,62 @@ static inline vp_site_t *vp_runtime_prepare_site(vp_map_t *vp, u16 site_id) {
 
 }
 
-/* Select the slot to update for one tagged distance:
-   matching active slot > empty slot > solved active slot > strictly-better
-   replacement of worst active slot. */
+/* Select the slot to update for one tagged distance.
+   The preferred_start_slot is this key's protected home slot. A different key
+   may not evict that slot while it is protected. If the home slot is currently
+   occupied only by overflow, its rightful home key reclaims it even with a
+   worse distance; non-improving same-key observations may still use
+   non-protected overflow slots. */
 static inline s32 vp_runtime_pick_slot(vp_site_t *site, u16 slot_count,
                                        u16 slot_key, u16 distance,
                                        u16 preferred_start_slot) {
 
-  u16 active_slot_mask = site->valid_mask & vp_runtime_site_mask(slot_count);
-
+  u16 protected_slot_mask = site->valid_mask & site->protected_mask &
+                            vp_runtime_site_mask(slot_count);
+  u16 visible_slot_mask = site->valid_mask & vp_runtime_site_mask(slot_count);
+  u16 home_slot_bit = (u16)(1U << preferred_start_slot);
   s32 first_empty_slot_idx = -1;
   s32 first_solved_slot_idx = -1;
   s32 worst_slot_idx = -1;
   u16 worst_slot_dist = 0;
+  u8  home_non_improving_match = 0;
 
-  /* Single-pass priority selection:
-     1) matching active key with strictly better distance
-     2) first empty slot
-     3) first solved slot (dist==0)
-     4) strictly-better replacement of current worst slot */
-  for (u16 i = 0, slot_idx = preferred_start_slot; i < slot_count; ++i) {
+  if (!vp_slot_is_active(visible_slot_mask, preferred_start_slot)) {
 
-    if (vp_slot_is_active(active_slot_mask, slot_idx)) {
+    return (s32)preferred_start_slot;
+
+  } else {
+
+    u16 home_dist = site->slots[preferred_start_slot].best_dist;
+    u8  home_matches = site->slots[preferred_start_slot].slot_key == slot_key;
+    u8  home_protected = (protected_slot_mask & home_slot_bit) != 0;
+
+    if (home_matches) {
+
+      if (distance < home_dist) { return (s32)preferred_start_slot; }
+      home_non_improving_match = 1;
+
+    } else if (!home_protected) {
+
+      return (s32)preferred_start_slot;
+
+    }
+
+  }
+
+  for (u16 i = 1, slot_idx = preferred_start_slot; i < slot_count; ++i) {
+
+    if (++slot_idx == slot_count) slot_idx = 0;
+
+    if (vp_slot_is_active(visible_slot_mask, slot_idx)) {
 
       u16 slot_dist = site->slots[slot_idx].best_dist;
-      if (site->slots[slot_idx].slot_key == slot_key) {
 
-        return distance < slot_dist ? (s32)slot_idx : -1;
+      if (vp_slot_is_active(protected_slot_mask, slot_idx)) { continue; }
+
+      if (site->slots[slot_idx].slot_key == slot_key && distance < slot_dist) {
+
+        return (s32)slot_idx;
 
       }
 
@@ -2932,9 +2961,12 @@ static inline s32 vp_runtime_pick_slot(vp_site_t *site, u16 slot_count,
 
     }
 
-    if (++slot_idx == slot_count) slot_idx = 0;
-
   }
+
+  /* Do not let non-improving observations of a key spill into empty/worst
+     overflow slots. In rolled loops this can pre-fill slots meant for later
+     dynamic hits, delaying or preventing progression to deeper compares. */
+  if (home_non_improving_match) return -1;
 
   if (first_empty_slot_idx >= 0) return first_empty_slot_idx;
   if (first_solved_slot_idx >= 0) return first_solved_slot_idx;
@@ -2960,6 +2992,15 @@ static inline void vp_runtime_store_dist(vp_map_t *vp, u16 site_id,
   u16 selected_slot_bit = (u16)(1U << selected_slot_idx);
   site->valid_mask |= selected_slot_bit;
   site->touched_mask |= selected_slot_bit;
+  if ((u16)selected_slot_idx == preferred_start_slot) {
+
+    site->protected_mask |= selected_slot_bit;
+
+  } else {
+
+    site->protected_mask &= (u16)~selected_slot_bit;
+
+  }
 
 }
 
@@ -2967,6 +3008,18 @@ static inline u16 vp_runtime_metric_key(u16 hit_ordinal, u8 metric_id) {
 
   u16 capped_hit_ordinal = MIN(hit_ordinal, (u16)0x7fff);
   return (u16)((capped_hit_ordinal << 1) | (metric_id & 1U));
+
+}
+
+/* Scalar compares use two distinct home slots per dynamic hit: one for
+   hamming, one for absolute distance. This avoids adjacent hits at the same
+   site overlapping on slot (h, h + 1), which would otherwise make a rolled
+   loop behave much worse than the equivalent unrolled code. */
+static inline u16 vp_runtime_scalar_pair_start_slot(u16 hit_ordinal,
+                                                    u16 slot_count) {
+
+  if (slot_count <= 1) return 0;
+  return (u16)(((u32)hit_ordinal * 2U) % slot_count);
 
 }
 
@@ -3003,7 +3056,7 @@ static inline void vp_runtime_record_scalar_dists(u16 site_id, u16 hamming_dist,
   if (site->hit_count < 0xffffU) { ++site->hit_count; }
 
   u16 preferred_start_slot =
-      slot_count == 1 ? 0 : (u16)(hit_ordinal % slot_count);
+      vp_runtime_scalar_pair_start_slot(hit_ordinal, slot_count);
   vp_runtime_store_dist(vp, site_id, site, slot_count,
                         vp_runtime_metric_key(hit_ordinal, 0), hamming_dist,
                         preferred_start_slot);

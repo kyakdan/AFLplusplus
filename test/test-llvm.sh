@@ -329,10 +329,12 @@ test -e ../afl-clang-fast -a -e ../split-switches-pass.so && {
   ../afl-clang-fast -o test-value-profile test-value-profile.c > /dev/null 2>&1
   AFL_LLVM_CMPLOG=1 ../afl-clang-fast -o test-value-profile.cmplog test-value-profile.c > /dev/null 2>&1
   AFL_LLVM_VALUE_PROFILE=1 ../afl-clang-fast -o test-value-profile.vp test-value-profile.c > /dev/null 2>&1
+  AFL_LLVM_VALUE_PROFILE=1 ../afl-clang-fast -O0 -fno-inline -fno-builtin -o test-value-profile-slot-spill.vp test-value-profile-slot-spill.c > /dev/null 2>&1
   AFL_LLVM_CMPLOG=1 AFL_LLVM_VALUE_PROFILE=1 ../afl-clang-fast -o test-value-profile.both test-value-profile.c > /dev/null 2>&1
-  test -e test-value-profile -a -e test-value-profile.cmplog -a -e test-value-profile.vp -a -e test-value-profile.both && {
+  test -e test-value-profile -a -e test-value-profile.cmplog -a -e test-value-profile.vp -a -e test-value-profile-slot-spill.vp -a -e test-value-profile.both && {
     $ECHO "$GREY[*] running afl-fuzz for llvm_mode value profiling checks, this will take approx 150 seconds"
     {
+      ./test-value-profile-slot-spill.vp >>errors 2>&1
       mkdir -p in
       echo 00000000 > in/in
       AFL_BENCH_UNTIL_CRASH=1 AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -m none -V20 -i in -o out_no_vp -c ./test-value-profile.cmplog -- ./test-value-profile >>errors 2>&1
@@ -430,7 +432,7 @@ test -e ../afl-clang-fast -a -e ../split-switches-pass.so && {
     $ECHO "$YELLOW[-] we cannot run VP post_process regression check because compilation failed"
     INCOMPLETE=1
   }
-  rm -rf errors errors_post vp_resume_no_vp.log vp_resume_with_vp.log vp_pre_resume_fuzzer_stats test-value-profile test-value-profile.cmplog test-value-profile.vp test-value-profile.both test-vp-postprocess test-vp-postprocess.cmplog test-vp-postprocess-mutator.so in in_post out_no_vp out_vp out_vp_stag out_vp_inline out_vp_l1 out_l1_err out_vp_post core.* /tmp/afl-vp-main.log /tmp/afl-vp-cmplog.log
+  rm -rf errors errors_post vp_resume_no_vp.log vp_resume_with_vp.log vp_pre_resume_fuzzer_stats test-value-profile test-value-profile.cmplog test-value-profile.vp test-value-profile-slot-spill.vp test-value-profile.both test-vp-postprocess test-vp-postprocess.cmplog test-vp-postprocess-mutator.so in in_post out_no_vp out_vp out_vp_stag out_vp_inline out_vp_l1 out_l1_err out_vp_post core.* /tmp/afl-vp-main.log /tmp/afl-vp-cmplog.log
  } || {
   $ECHO "$YELLOW[-] value profiling requires CmpLog, too slow to test in ARM CI"
   INCOMPLETE=1

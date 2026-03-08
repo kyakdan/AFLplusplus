@@ -442,6 +442,132 @@ static void test_runtime_frontier_keeps_separate_metric_tags(void **state) {
 
 }
 
+static void test_runtime_frontier_keeps_same_tag_overflow_slot(void **state) {
+
+  (void)state;
+
+  afl_state_t        afl;
+  vp_map_t          *vp;
+  struct queue_entry q;
+  u32                site = 29;
+  size_t             idx0, idx1;
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q, 0, sizeof(q));
+  q.exec_us = 7;
+  q.len = 13;
+
+  vp = calloc(1, sizeof(vp_map_t));
+  assert_non_null(vp);
+
+  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
+  afl.value_profile_mode = 1;
+  afl.value_profile_active = 1;
+  afl.queue_cycle = 1;
+  afl.shm.vp_map = vp;
+  setup_vp_frontier(&afl, 4);
+
+  vp->exec_id = 1;
+  vp->enabled = 1;
+  vp->control_len = 1;
+  vp->control[0] = (u16)site;
+  vp->site[site].valid_mask = 0x3;
+  vp->site[site].protected_mask = 0x1;
+  vp->site[site].touched_mask = 0x3;
+  /* Protected home slot plus same-key overflow slot. */
+  vp->site[site].slots[0].slot_key = 0;
+  vp->site[site].slots[0].best_dist = 21;
+  vp->site[site].slots[1].slot_key = 0;
+  vp->site[site].slots[1].best_dist = 26;
+
+  assert_true(vp_frontier_would_improve(&afl));
+  vp_frontier_apply(&afl, &q);
+
+  idx0 = vp_test_frontier_idx(&afl, site, 0);
+  idx1 = vp_test_frontier_idx(&afl, site, 1);
+  assert_ptr_equal(afl.vp_frontier[idx0].owner, &q);
+  assert_ptr_equal(afl.vp_frontier[idx1].owner, &q);
+  assert_int_equal(afl.vp_frontier[idx0].tag, 0);
+  assert_int_equal(afl.vp_frontier[idx0].dist, 21);
+  assert_int_equal(afl.vp_frontier[idx1].tag, 0);
+  assert_int_equal(afl.vp_frontier[idx1].dist, 26);
+  assert_int_equal(q.vp_ref_cnt, 2);
+  assert_ptr_equal(afl.top_rated_vp[site], &q);
+  assert_int_equal(afl.top_rated_vp_dist[site], 21);
+
+  free_vp_frontier(&afl);
+  free(vp);
+
+}
+
+
+static void test_runtime_frontier_keeps_three_scalar_hit_pairs(void **state) {
+
+  (void)state;
+
+  afl_state_t        afl;
+  vp_map_t          *vp;
+  struct queue_entry q;
+  u32                site = 31;
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q, 0, sizeof(q));
+  q.exec_us = 9;
+  q.len = 17;
+
+  vp = calloc(1, sizeof(vp_map_t));
+  assert_non_null(vp);
+
+  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
+  afl.value_profile_mode = 1;
+  afl.value_profile_active = 1;
+  afl.queue_cycle = 1;
+  afl.shm.vp_map = vp;
+  setup_vp_frontier(&afl, 6);
+
+  vp->exec_id = 1;
+  vp->enabled = 1;
+  vp->control_len = 1;
+  vp->control[0] = (u16)site;
+  vp->site[site].valid_mask = 0x3f;
+  vp->site[site].protected_mask = 0x3f;
+  vp->site[site].touched_mask = 0x3f;
+  /* Three scalar hits with two metrics each should occupy distinct slot pairs
+     once imported into a six-slot frontier. */
+  vp->site[site].slots[0].slot_key = 0;
+  vp->site[site].slots[0].best_dist = 7;
+  vp->site[site].slots[1].slot_key = 1;
+  vp->site[site].slots[1].best_dist = 12;
+  vp->site[site].slots[2].slot_key = 2;
+  vp->site[site].slots[2].best_dist = 5;
+  vp->site[site].slots[3].slot_key = 3;
+  vp->site[site].slots[3].best_dist = 11;
+  vp->site[site].slots[4].slot_key = 4;
+  vp->site[site].slots[4].best_dist = 3;
+  vp->site[site].slots[5].slot_key = 5;
+  vp->site[site].slots[5].best_dist = 9;
+
+  assert_true(vp_frontier_would_improve(&afl));
+  vp_frontier_apply(&afl, &q);
+
+  for (u32 i = 0; i < 6; ++i) {
+
+    size_t idx = vp_test_frontier_idx(&afl, site, i);
+    assert_ptr_equal(afl.vp_frontier[idx].owner, &q);
+    assert_int_equal(afl.vp_frontier[idx].tag, i);
+    assert_true(afl.vp_frontier[idx].is_protected);
+
+  }
+
+  assert_int_equal(q.vp_ref_cnt, 6);
+  assert_ptr_equal(afl.top_rated_vp[site], &q);
+  assert_int_equal(afl.top_rated_vp_dist[site], 3);
+
+  free_vp_frontier(&afl);
+  free(vp);
+
+}
+
 static void test_runtime_trim_guard_preserve_and_regress(void **state) {
 
   (void)state;
@@ -698,6 +824,8 @@ int main(int argc, char **argv) {
       cmocka_unit_test(test_solved_rtn_compare_does_not_consume_vp_bits),
       cmocka_unit_test(test_runtime_frontier_update_with_overflow_scan),
       cmocka_unit_test(test_runtime_frontier_keeps_separate_metric_tags),
+      cmocka_unit_test(test_runtime_frontier_keeps_same_tag_overflow_slot),
+      cmocka_unit_test(test_runtime_frontier_keeps_three_scalar_hit_pairs),
       cmocka_unit_test(test_runtime_trim_guard_preserve_and_regress),
       cmocka_unit_test(test_cmplog_inline_trim_guard_preserve_and_regress),
       cmocka_unit_test(test_cmplog_child_trim_guard_preserve_and_regress),
