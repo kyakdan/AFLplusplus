@@ -500,7 +500,6 @@ static void test_runtime_frontier_keeps_same_tag_overflow_slot(void **state) {
 
 }
 
-
 static void test_runtime_frontier_keeps_three_scalar_hit_pairs(void **state) {
 
   (void)state;
@@ -562,6 +561,129 @@ static void test_runtime_frontier_keeps_three_scalar_hit_pairs(void **state) {
   assert_int_equal(q.vp_ref_cnt, 6);
   assert_ptr_equal(afl.top_rated_vp[site], &q);
   assert_int_equal(afl.top_rated_vp_dist[site], 3);
+
+  free_vp_frontier(&afl);
+  free(vp);
+
+}
+
+static void test_l1_favoring_marks_only_protected_slots(void **state) {
+
+  (void)state;
+
+  afl_state_t         afl;
+  struct queue_entry  q_protected0, q_overflow, q_protected1;
+  u32                 site0 = 5, site1 = 9;
+  size_t              idx0, idx1, idx2;
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q_protected0, 0, sizeof(q_protected0));
+  memset(&q_overflow, 0, sizeof(q_overflow));
+  memset(&q_protected1, 0, sizeof(q_protected1));
+  afl.smallest_favored = -1;
+  afl.value_profile_mode = 1;
+  afl.value_profile_active = 1;
+  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
+  setup_vp_frontier(&afl, 4);
+
+  q_protected0.id = 10;
+  q_overflow.id = 20;
+  q_protected1.id = 30;
+
+  idx0 = vp_test_frontier_idx(&afl, site0, 0);
+  idx1 = vp_test_frontier_idx(&afl, site0, 1);
+  idx2 = vp_test_frontier_idx(&afl, site1, 0);
+
+  afl.vp_frontier[idx0].owner = &q_protected0;
+  afl.vp_frontier[idx0].tag = 1;
+  afl.vp_frontier[idx0].dist = 7;
+  afl.vp_frontier[idx0].cost = 100;
+  afl.vp_frontier[idx0].is_protected = 1;
+
+  afl.vp_frontier[idx1].owner = &q_overflow;
+  afl.vp_frontier[idx1].tag = 1;
+  afl.vp_frontier[idx1].dist = 9;
+  afl.vp_frontier[idx1].cost = 200;
+  afl.vp_frontier[idx1].is_protected = 0;
+
+  afl.vp_frontier[idx2].owner = &q_protected1;
+  afl.vp_frontier[idx2].tag = 2;
+  afl.vp_frontier[idx2].dist = 5;
+  afl.vp_frontier[idx2].cost = 300;
+  afl.vp_frontier[idx2].is_protected = 1;
+
+  vp_mark_favored_runtime_slots(&afl);
+
+  assert_true(q_protected0.favored);
+  assert_false(q_overflow.favored);
+  assert_true(q_protected1.favored);
+  assert_int_equal(afl.queued_favored, 2);
+  assert_int_equal(afl.pending_favored, 2);
+  assert_int_equal(afl.smallest_favored, 10);
+
+  free_vp_frontier(&afl);
+
+}
+
+static void test_runtime_frontier_prefers_protected_same_tag_on_equal_dist(
+    void **state) {
+
+  (void)state;
+
+  afl_state_t         afl;
+  vp_map_t           *vp;
+  struct queue_entry  q_overflow, q_home;
+  u32                 site = 37;
+  size_t              idx;
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q_overflow, 0, sizeof(q_overflow));
+  memset(&q_home, 0, sizeof(q_home));
+  q_overflow.exec_us = 10;
+  q_overflow.len = 10;
+  q_home.exec_us = 10;
+  q_home.len = 10;
+
+  vp = calloc(1, sizeof(vp_map_t));
+  assert_non_null(vp);
+
+  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
+  afl.value_profile_mode = 1;
+  afl.value_profile_active = 1;
+  afl.queue_cycle = 1;
+  afl.shm.vp_map = vp;
+  setup_vp_frontier(&afl, 1);
+
+  vp->exec_id = 1;
+  vp->enabled = 1;
+  vp->control_len = 1;
+  vp->control[0] = (u16)site;
+  vp->site[site].valid_mask = 0x1;
+  vp->site[site].touched_mask = 0x1;
+  vp->site[site].protected_mask = 0x0;
+  vp->site[site].slots[0].slot_key = 0;
+  vp->site[site].slots[0].best_dist = 7;
+
+  assert_true(vp_frontier_would_improve(&afl));
+  vp_frontier_apply(&afl, &q_overflow);
+
+  idx = vp_test_frontier_idx(&afl, site, 0);
+  assert_ptr_equal(afl.vp_frontier[idx].owner, &q_overflow);
+  assert_false(afl.vp_frontier[idx].is_protected);
+
+  vp->exec_id = 2;
+  vp->site[site].touched_mask = 0x1;
+  vp->site[site].protected_mask = 0x1;
+  vp->site[site].slots[0].slot_key = 0;
+  vp->site[site].slots[0].best_dist = 7;
+
+  assert_true(vp_frontier_would_improve(&afl));
+  vp_frontier_apply(&afl, &q_home);
+
+  assert_ptr_equal(afl.vp_frontier[idx].owner, &q_home);
+  assert_true(afl.vp_frontier[idx].is_protected);
+  assert_int_equal(q_overflow.vp_ref_cnt, 0);
+  assert_int_equal(q_home.vp_ref_cnt, 1);
 
   free_vp_frontier(&afl);
   free(vp);
@@ -826,6 +948,9 @@ int main(int argc, char **argv) {
       cmocka_unit_test(test_runtime_frontier_keeps_separate_metric_tags),
       cmocka_unit_test(test_runtime_frontier_keeps_same_tag_overflow_slot),
       cmocka_unit_test(test_runtime_frontier_keeps_three_scalar_hit_pairs),
+      cmocka_unit_test(test_l1_favoring_marks_only_protected_slots),
+      cmocka_unit_test(
+          test_runtime_frontier_prefers_protected_same_tag_on_equal_dist),
       cmocka_unit_test(test_runtime_trim_guard_preserve_and_regress),
       cmocka_unit_test(test_cmplog_inline_trim_guard_preserve_and_regress),
       cmocka_unit_test(test_cmplog_child_trim_guard_preserve_and_regress),

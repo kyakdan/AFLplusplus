@@ -1001,9 +1001,15 @@ void cull_queue(afl_state_t *afl) {
 
   }
 
-  /* Mark VP top-rated entries as favored only while VP guidance is enabled.
-     In mode 2, value profiling can toggle off after coverage recovers. */
-  if (afl->top_rated_vp && afl->value_profile_active) {
+  /* Mark VP winners as favored only while VP guidance is enabled.
+     L1 can preserve multiple protected home slots per site, so favor those
+     directly. L2 still uses the cached per-site winner. */
+  if (afl->vp_frontier && afl->value_profile_active &&
+      afl->value_profile_source == VP_SOURCE_RUNTIME_SHM) {
+
+    vp_mark_favored_runtime_slots(afl);
+
+  } else if (afl->top_rated_vp && afl->value_profile_active) {
 
     for (i = 0; i < CMP_MAP_W; ++i) {
 
