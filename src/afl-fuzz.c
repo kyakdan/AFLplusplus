@@ -2002,7 +2002,11 @@ int main(int argc, char **argv_orig, char **envp) {
 
     }
 
-    size_t vp_frontier_slots = (size_t)CMP_MAP_W * afl->value_profile_slots;
+    size_t vp_slot_replicas = afl->value_profile_source == VP_SOURCE_RUNTIME_SHM
+                                  ? VP_RUNTIME_SLOT_REPLICA_LIMIT
+                                  : 1U;
+    size_t vp_frontier_slots =
+        (size_t)CMP_MAP_W * afl->value_profile_slots * vp_slot_replicas;
     afl->vp_frontier =
         ck_alloc(vp_frontier_slots * sizeof(vp_frontier_entry_t));
     for (size_t i = 0; i < vp_frontier_slots; ++i) {
@@ -2011,10 +2015,11 @@ int main(int argc, char **argv_orig, char **envp) {
 
     }
 
-    OKF("Value profiling: mode %u%s, level %u, slots %u, source=%s",
+    OKF("Value profiling: mode %u%s, level %u, slots %u, replicas %zu, "
+        "source=%s",
         afl->value_profile_mode,
         afl->value_profile_mode == 1 ? " (always on)" : " (stagnation)",
-        afl->value_profile_level, afl->value_profile_slots,
+        afl->value_profile_level, afl->value_profile_slots, vp_slot_replicas,
         afl->value_profile_level == 1 ? "runtime-shm" : "cmplog");
 
   }

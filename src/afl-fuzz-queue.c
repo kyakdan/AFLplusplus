@@ -1002,8 +1002,8 @@ void cull_queue(afl_state_t *afl) {
   }
 
   /* Mark VP winners as favored only while VP guidance is enabled.
-     L1 can preserve multiple protected home slots per site, so favor those
-     directly. L2 still uses the cached per-site winner. */
+     L1 favors the best retained entries within each runtime slot group.
+     L2 still uses the cached per-site winner. */
   if (afl->vp_frontier && afl->value_profile_active &&
       afl->value_profile_source == VP_SOURCE_RUNTIME_SHM) {
 

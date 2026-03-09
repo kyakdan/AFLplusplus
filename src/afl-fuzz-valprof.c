@@ -563,9 +563,31 @@ u32 vp_check_cmpmap(afl_state_t *afl) {
 }
 
 /* First frontier slot index for a compare site. */
+static inline u32 vp_frontier_slot_replicas(afl_state_t *afl) {
+
+  return afl->value_profile_source == VP_SOURCE_RUNTIME_SHM
+             ? VP_RUNTIME_SLOT_REPLICA_LIMIT
+             : 1U;
+
+}
+
+static inline size_t vp_frontier_site_span(afl_state_t *afl) {
+
+  return (size_t)afl->value_profile_slots * vp_frontier_slot_replicas(afl);
+
+}
+
 static inline size_t vp_site_base(afl_state_t *afl, u32 site) {
 
-  return (size_t)site * afl->value_profile_slots;
+  return (size_t)site * vp_frontier_site_span(afl);
+
+}
+
+static inline size_t vp_runtime_slot_base(afl_state_t *afl, u32 site,
+                                          u16 slot_rel) {
+
+  return vp_site_base(afl, site) +
+         (size_t)slot_rel * VP_RUNTIME_SLOT_REPLICA_LIMIT;
 
 }
 
@@ -653,11 +675,12 @@ static inline void vp_clear_slot(afl_state_t *afl, size_t idx) {
 static inline void vp_refresh_site_winner(afl_state_t *afl, u32 site) {
 
   size_t              base = vp_site_base(afl, site);
+  size_t              span = vp_frontier_site_span(afl);
   struct queue_entry *best_q = NULL;
   u32                 best_dist = VP_DIST_UNSOLVED;
   u64                 best_cost = ~(u64)0;
 
-  for (u32 i = 0; i < afl->value_profile_slots; ++i) {
+  for (size_t i = 0; i < span; ++i) {
 
     size_t              idx = base + i;
     struct queue_entry *owner = afl->vp_frontier[idx].owner;
@@ -719,11 +742,16 @@ static inline u8 vp_site_refresh_needed(afl_state_t *afl, u32 site,
 
 typedef struct {
 
+  u16 slot_rel;
   u16 tag;
   u32 dist;
   u8  is_protected;
 
 } vp_site_candidate_t;
+
+static inline u8 vp_runtime_entry_precedes(u32 cand_dist, u64 cand_cost,
+                                           u8 cand_is_protected, u32 old_dist,
+                                           u64 old_cost, u8 old_is_protected);
 
 /* Frontier slot validity check shared by scan paths. */
 static inline u8 vp_frontier_slot_is_empty(const struct queue_entry *owner,
@@ -755,6 +783,7 @@ static inline u32 vp_collect_runtime_site_candidates(const vp_site_t *site,
     u16 dist = site->slots[i].best_dist;
     if (!dist) continue;
 
+    out[n].slot_rel = i;
     out[n].tag = site->slots[i].slot_key;
     out[n].dist = dist;
     out[n].is_protected = (u8)((site->protected_mask >> i) & 1U);
@@ -772,25 +801,60 @@ void vp_mark_favored_runtime_slots(afl_state_t *afl) {
       afl->value_profile_source != VP_SOURCE_RUNTIME_SHM)
     return;
 
-  size_t vp_frontier_slots = (size_t)CMP_MAP_W * afl->value_profile_slots;
-  for (size_t slot = 0; slot < vp_frontier_slots; ++slot) {
+  for (u32 site = 0; site < CMP_MAP_W; ++site) {
 
-    vp_frontier_entry_t *entry = &afl->vp_frontier[slot];
-    struct queue_entry  *q = entry->owner;
-    if (!entry->is_protected || !q || q->disabled || q->favored ||
-        entry->dist == 0 || entry->dist >= VP_DIST_UNSOLVED)
-      continue;
+    for (u16 slot_rel = 0; slot_rel < afl->value_profile_slots; ++slot_rel) {
 
-    q->favored = 1;
-    ++afl->queued_favored;
+      u8 used = 0;
+      for (u16 pick = 0; pick < VP_RUNTIME_SLOT_FAVOR_LIMIT; ++pick) {
 
-    if (!q->was_fuzzed) {
+        size_t best_idx = SIZE_MAX;
+        for (u16 replica = 0; replica < VP_RUNTIME_SLOT_REPLICA_LIMIT;
+             ++replica) {
 
-      ++afl->pending_favored;
-      if (unlikely(afl->smallest_favored < 0 ||
-                   afl->smallest_favored > (s64)q->id)) {
+          if (used & (1U << replica)) continue;
 
-        afl->smallest_favored = (s64)q->id;
+          size_t idx = vp_runtime_slot_base(afl, site, slot_rel) + replica;
+          vp_frontier_entry_t *entry = &afl->vp_frontier[idx];
+          struct queue_entry  *q = entry->owner;
+          if (!q || q->disabled || entry->dist == 0 ||
+              entry->dist >= VP_DIST_UNSOLVED)
+            continue;
+
+          if (best_idx == SIZE_MAX ||
+              vp_runtime_entry_precedes(
+                  entry->dist, entry->cost, entry->is_protected,
+                  afl->vp_frontier[best_idx].dist,
+                  afl->vp_frontier[best_idx].cost,
+                  afl->vp_frontier[best_idx].is_protected)) {
+
+            best_idx = idx;
+
+          }
+
+        }
+
+        if (best_idx == SIZE_MAX) break;
+        used |=
+            1U << (u16)(best_idx - vp_runtime_slot_base(afl, site, slot_rel));
+
+        struct queue_entry *q = afl->vp_frontier[best_idx].owner;
+        if (!q || q->disabled || q->favored) continue;
+
+        q->favored = 1;
+        ++afl->queued_favored;
+
+        if (!q->was_fuzzed) {
+
+          ++afl->pending_favored;
+          if (unlikely(afl->smallest_favored < 0 ||
+                       afl->smallest_favored > (s64)q->id)) {
+
+            afl->smallest_favored = (s64)q->id;
+
+          }
+
+        }
 
       }
 
@@ -815,6 +879,177 @@ static inline size_t vp_frontier_site_abs_idx(const vp_frontier_site_ctx_t *ctx,
                                               u16 rel_idx) {
 
   return ctx->base + (size_t)rel_idx;
+
+}
+
+typedef struct {
+
+  size_t base;                 /* First replica index for this runtime slot */
+  u16    replicas;             /* Replica count per runtime slot            */
+  s32    first_empty_rel;      /* First empty replica, else -1              */
+  s32    worst_rel;            /* Worst retained replica, else -1           */
+  u32    worst_dist;           /* Distance of worst_rel                     */
+  u64    worst_cost;           /* Cost of worst_rel                         */
+  u8     worst_is_protected;   /* Protected status of worst_rel             */
+
+} vp_frontier_runtime_slot_ctx_t;
+
+static inline size_t vp_frontier_runtime_slot_abs_idx(
+    const vp_frontier_runtime_slot_ctx_t *ctx, u16 rel_idx) {
+
+  return ctx->base + (size_t)rel_idx;
+
+}
+
+static inline u8 vp_runtime_entry_precedes(u32 cand_dist, u64 cand_cost,
+                                           u8 cand_is_protected, u32 old_dist,
+                                           u64 old_cost, u8 old_is_protected) {
+
+  if (cand_dist < old_dist) return 1;
+  if (cand_dist > old_dist) return 0;
+  if (cand_cost < old_cost) return 1;
+  if (cand_cost > old_cost) return 0;
+  return cand_is_protected && !old_is_protected;
+
+}
+
+static inline void vp_frontier_runtime_slot_ctx_recompute(
+    afl_state_t *afl, vp_frontier_runtime_slot_ctx_t *ctx) {
+
+  ctx->first_empty_rel = -1;
+  ctx->worst_rel = -1;
+  ctx->worst_dist = 0;
+  ctx->worst_cost = 0;
+  ctx->worst_is_protected = 0;
+
+  for (u16 rel_idx = 0; rel_idx < ctx->replicas; ++rel_idx) {
+
+    size_t               idx = vp_frontier_runtime_slot_abs_idx(ctx, rel_idx);
+    vp_frontier_entry_t *entry = &afl->vp_frontier[idx];
+    struct queue_entry  *owner = entry->owner;
+    u32                  dist = entry->dist;
+
+    if (vp_frontier_slot_is_empty(owner, dist)) {
+
+      if (ctx->first_empty_rel < 0) ctx->first_empty_rel = (s32)rel_idx;
+      continue;
+
+    }
+
+    if (ctx->worst_rel < 0 ||
+        vp_runtime_entry_precedes(ctx->worst_dist, ctx->worst_cost,
+                                  ctx->worst_is_protected, dist, entry->cost,
+                                  entry->is_protected)) {
+
+      ctx->worst_rel = (s32)rel_idx;
+      ctx->worst_dist = dist;
+      ctx->worst_cost = entry->cost;
+      ctx->worst_is_protected = entry->is_protected;
+
+    }
+
+  }
+
+}
+
+static inline void vp_frontier_runtime_slot_ctx_init(
+    afl_state_t *afl, u32 site, u16 slot_rel, u8 clear_stale,
+    vp_frontier_runtime_slot_ctx_t *ctx) {
+
+  ctx->base = vp_runtime_slot_base(afl, site, slot_rel);
+  ctx->replicas = VP_RUNTIME_SLOT_REPLICA_LIMIT;
+
+  if (clear_stale) {
+
+    for (u16 rel_idx = 0; rel_idx < ctx->replicas; ++rel_idx) {
+
+      size_t              idx = vp_frontier_runtime_slot_abs_idx(ctx, rel_idx);
+      struct queue_entry *owner = afl->vp_frontier[idx].owner;
+      if (owner && owner->disabled) { vp_clear_slot(afl, idx); }
+
+    }
+
+  }
+
+  vp_frontier_runtime_slot_ctx_recompute(afl, ctx);
+
+}
+
+static inline s32 vp_frontier_runtime_slot_find_owner(
+    afl_state_t *afl, vp_frontier_runtime_slot_ctx_t *ctx,
+    const struct queue_entry *q) {
+
+  for (u16 rel_idx = 0; rel_idx < ctx->replicas; ++rel_idx) {
+
+    size_t idx = vp_frontier_runtime_slot_abs_idx(ctx, rel_idx);
+    if (afl->vp_frontier[idx].owner == q &&
+        afl->vp_frontier[idx].dist < VP_DIST_UNSOLVED)
+      return (s32)rel_idx;
+
+  }
+
+  return -1;
+
+}
+
+static inline u8 vp_frontier_runtime_slot_would_improve_ctx(
+    vp_frontier_runtime_slot_ctx_t *ctx, u32 dist, u8 is_protected) {
+
+  if (!dist || dist >= VP_DIST_UNSOLVED) return 0;
+  if (ctx->first_empty_rel >= 0) return 1;
+
+  assert(ctx->worst_rel >= 0);
+  return vp_runtime_entry_precedes(dist, 0, is_protected, ctx->worst_dist, 0,
+                                   ctx->worst_is_protected);
+
+}
+
+static inline u8 vp_frontier_runtime_slot_apply_ctx(
+    afl_state_t *afl, struct queue_entry *q,
+    vp_frontier_runtime_slot_ctx_t *ctx, u16 tag, u32 dist, u64 cost,
+    u8 is_protected) {
+
+  if (!dist || dist >= VP_DIST_UNSOLVED) return 0;
+
+  s32    chosen_rel = vp_frontier_runtime_slot_find_owner(afl, ctx, q);
+  size_t chosen_idx;
+
+  if (chosen_rel >= 0) {
+
+    chosen_idx = vp_frontier_runtime_slot_abs_idx(ctx, (u16)chosen_rel);
+    vp_frontier_entry_t *entry = &afl->vp_frontier[chosen_idx];
+    if (tag == entry->tag &&
+        !vp_runtime_entry_precedes(dist, cost, is_protected, entry->dist,
+                                   entry->cost, entry->is_protected))
+      return 0;
+
+  } else if (ctx->first_empty_rel >= 0) {
+
+    chosen_rel = ctx->first_empty_rel;
+    chosen_idx = vp_frontier_runtime_slot_abs_idx(ctx, (u16)chosen_rel);
+
+  } else {
+
+    assert(ctx->worst_rel >= 0);
+    if (!vp_runtime_entry_precedes(dist, cost, is_protected, ctx->worst_dist,
+                                   ctx->worst_cost, ctx->worst_is_protected))
+      return 0;
+    chosen_rel = ctx->worst_rel;
+    chosen_idx = vp_frontier_runtime_slot_abs_idx(ctx, (u16)chosen_rel);
+
+  }
+
+  struct queue_entry *old = afl->vp_frontier[chosen_idx].owner;
+  if (old && old != q) vp_dec_ref(afl, old);
+  if (old != q) { vp_inc_ref(q); }
+
+  afl->vp_frontier[chosen_idx].owner = q;
+  afl->vp_frontier[chosen_idx].tag = tag;
+  afl->vp_frontier[chosen_idx].dist = dist;
+  afl->vp_frontier[chosen_idx].cost = cost;
+  afl->vp_frontier[chosen_idx].is_protected = is_protected;
+  vp_frontier_runtime_slot_ctx_recompute(afl, ctx);
+  return 1;
 
 }
 
@@ -1030,6 +1265,7 @@ static inline u32 vp_collect_cmplog_site_candidates(struct cmp_map *cmp, u32 k,
                                &abs_dist))
         continue;
 
+      out[n].slot_rel = 0;
       out[n].tag = (u16)(j & 31U);
       out[n].dist = MIN(hamming, abs_dist);
       out[n].is_protected = 0;
@@ -1046,6 +1282,7 @@ static inline u32 vp_collect_cmplog_site_candidates(struct cmp_map *cmp, u32 k,
       u32 max_len, prefix_len;
       if (analyze_rtn_compare(&rtn[j], &max_len, &prefix_len)) continue;
 
+      out[n].slot_rel = 0;
       out[n].tag = vp_rtn_compare_tag(max_len, ord_in_len_class);
       out[n].dist = vp_rtn_compare_dist(&rtn[j], max_len, prefix_len);
       out[n].is_protected = 0;
@@ -1089,10 +1326,55 @@ static inline u8 vp_apply_site_candidates(afl_state_t        *afl,
 
 }
 
+static inline void vp_frontier_site_clear_stale(afl_state_t *afl, u32 site) {
+
+  size_t base = vp_site_base(afl, site);
+  size_t span = vp_frontier_site_span(afl);
+  for (size_t rel = 0; rel < span; ++rel) {
+
+    size_t              idx = base + rel;
+    struct queue_entry *owner = afl->vp_frontier[idx].owner;
+    if (owner && owner->disabled) { vp_clear_slot(afl, idx); }
+
+  }
+
+}
+
+static inline u8 vp_apply_runtime_site_candidates(
+    afl_state_t *afl, struct queue_entry *q, u32 site,
+    vp_site_candidate_t *candidates, u32 cand_count, u64 cost) {
+
+  u8 site_changed = 0;
+  if (cand_count) { vp_frontier_site_clear_stale(afl, site); }
+
+  for (u32 i = 0; i < cand_count; ++i) {
+
+    vp_frontier_runtime_slot_ctx_t ctx;
+    vp_frontier_runtime_slot_ctx_init(afl, site, candidates[i].slot_rel, 0,
+                                      &ctx);
+
+    if (vp_frontier_runtime_slot_apply_ctx(afl, q, &ctx, candidates[i].tag,
+                                           candidates[i].dist, cost,
+                                           candidates[i].is_protected))
+      site_changed = 1;
+
+  }
+
+  if (vp_site_refresh_needed(afl, site, site_changed)) {
+
+    vp_refresh_site_winner(afl, site);
+
+  }
+
+  return site_changed;
+
+}
+
 typedef struct {
 
   u32 site;
   u32 max_dist;
+  u16 slot_rel;
   u16 tag;
   u16 need;
   u16 seen;
@@ -1149,13 +1431,13 @@ static inline void vp_trim_guard_add_site(vp_trim_guard_t *guard, u32 site) {
 }
 
 static inline void vp_trim_guard_add_req(vp_trim_guard_t *guard, u32 site,
-                                         u32 site_req_start, u16 tag,
-                                         u32 max_dist) {
+                                         u32 site_req_start, u16 slot_rel,
+                                         u16 tag, u32 max_dist) {
 
   for (u32 i = site_req_start; i < guard->req_cnt; ++i) {
 
     vp_trim_req_t *r = &guard->req[i];
-    if (r->tag == tag && r->max_dist == max_dist) {
+    if (r->slot_rel == slot_rel && r->tag == tag && r->max_dist == max_dist) {
 
       if (r->need < 0xffffU) { ++r->need; }
       return;
@@ -1174,6 +1456,7 @@ static inline void vp_trim_guard_add_req(vp_trim_guard_t *guard, u32 site,
 
   vp_trim_req_t *r = &guard->req[guard->req_cnt++];
   r->site = site;
+  r->slot_rel = slot_rel;
   r->tag = tag;
   r->max_dist = max_dist;
   r->need = 1;
@@ -1217,10 +1500,11 @@ static inline u8 vp_trim_guard_all_seen(const vp_trim_guard_t *guard) {
 
 }
 
-/* Assign one observed (site,tag,dist) candidate to the strictest unsatisfied
-   guarded requirement that it can satisfy. */
+/* Assign one observed (site,slot,tag,dist) candidate to the strictest
+   unsatisfied guarded requirement that it can satisfy. */
 static inline void vp_trim_guard_assign_candidate(vp_trim_guard_t *guard,
-                                                  u32 site, u16 tag, u32 dist) {
+                                                  u32 site, u16 slot_rel,
+                                                  u16 tag, u32 dist) {
 
   s32 best = -1;
   u32 best_max_dist = ~(u32)0;
@@ -1228,8 +1512,8 @@ static inline void vp_trim_guard_assign_candidate(vp_trim_guard_t *guard,
   for (u32 i = 0; i < guard->req_cnt; ++i) {
 
     vp_trim_req_t *r = &guard->req[i];
-    if (r->site != site || r->tag != tag || r->seen >= r->need ||
-        dist > r->max_dist)
+    if (r->site != site || r->slot_rel != slot_rel || r->tag != tag ||
+        r->seen >= r->need || dist > r->max_dist)
       continue;
 
     if (best < 0 || r->max_dist < best_max_dist) {
@@ -1261,8 +1545,8 @@ static inline u8 vp_trim_guard_eval_runtime(vp_trim_guard_t *guard) {
 
     for (u32 j = 0; j < cand_count; ++j) {
 
-      vp_trim_guard_assign_candidate(guard, site_id, candidates[j].tag,
-                                     candidates[j].dist);
+      vp_trim_guard_assign_candidate(guard, site_id, candidates[j].slot_rel,
+                                     candidates[j].tag, candidates[j].dist);
 
     }
 
@@ -1286,7 +1570,7 @@ static inline u8 vp_trim_guard_eval_cmplog(vp_trim_guard_t *guard) {
 
     for (u32 j = 0; j < cand_count; ++j) {
 
-      vp_trim_guard_assign_candidate(guard, site_id, candidates[j].tag,
+      vp_trim_guard_assign_candidate(guard, site_id, 0, candidates[j].tag,
                                      candidates[j].dist);
 
     }
@@ -1312,7 +1596,7 @@ vp_trim_guard_t *vp_trim_guard_init(afl_state_t *afl, struct queue_entry *q) {
   guard->afl = afl;
   guard->q = q;
   guard->source = afl->value_profile_source;
-  guard->slots = (u16)afl->value_profile_slots;
+  guard->slots = (u16)vp_frontier_site_span(afl);
 
   u32 refs_left = q->vp_ref_cnt;
   for (u32 site = 0; site < CMP_MAP_W && refs_left; ++site) {
@@ -1333,7 +1617,10 @@ vp_trim_guard_t *vp_trim_guard_init(afl_state_t *afl, struct queue_entry *q) {
       }
 
       vp_trim_guard_add_owned(guard, base + rel);
-      vp_trim_guard_add_req(guard, site, site_req_start, entry->tag,
+      u16 slot_rel = guard->source == VP_SOURCE_RUNTIME_SHM
+                         ? (u16)(rel / VP_RUNTIME_SLOT_REPLICA_LIMIT)
+                         : 0;
+      vp_trim_guard_add_req(guard, site, site_req_start, slot_rel, entry->tag,
                             entry->dist);
       --refs_left;
 
@@ -1471,7 +1758,7 @@ void vp_trim_guard_refresh_owner_cost(vp_trim_guard_t *guard) {
   afl_state_t        *afl = guard->afl;
   struct queue_entry *q = guard->q;
   u64                 owner_cost = vp_entry_cost(q);
-  u32                 slots = afl->value_profile_slots;
+  u32                 slots = (u32)vp_frontier_site_span(afl);
 
   s32 last_site = -1;
   u8  site_touched = 0;
@@ -1530,7 +1817,7 @@ void vp_trim_refresh_owner_cost(afl_state_t *afl, struct queue_entry *q) {
 
   u64 owner_cost = vp_entry_cost(q);
   u32 refs_left = q->vp_ref_cnt;
-  u16 slots = (u16)afl->value_profile_slots;
+  u16 slots = (u16)vp_frontier_site_span(afl);
 
   for (u32 site = 0; site < CMP_MAP_W && refs_left; ++site) {
 
@@ -1580,14 +1867,14 @@ u8 vp_frontier_would_improve(afl_state_t *afl) {
     vp_site_candidate_t candidates[VP_MAX_SLOTS];
     u32                 cand_count = vp_collect_runtime_site_candidates(
         site, active_mask, candidates, max_slot_count);
-    vp_frontier_site_ctx_t ctx;
-    vp_frontier_site_ctx_init(afl, k, 0, &ctx);
 
     for (u32 i = 0; i < cand_count; ++i) {
 
-      if (vp_frontier_site_would_improve_ctx(afl, &ctx, candidates[i].tag,
-                                             candidates[i].dist,
-                                             candidates[i].is_protected))
+      vp_frontier_runtime_slot_ctx_t ctx;
+      vp_frontier_runtime_slot_ctx_init(afl, k, candidates[i].slot_rel, 0,
+                                        &ctx);
+      if (vp_frontier_runtime_slot_would_improve_ctx(
+              &ctx, candidates[i].dist, candidates[i].is_protected))
         return 1;
 
     }
@@ -1619,7 +1906,8 @@ static inline u8 vp_apply_runtime_frontier(afl_state_t        *afl,
     u32                 cand_count = vp_collect_runtime_site_candidates(
         site, active_mask, candidates, max_slot_count);
 
-    if (vp_apply_site_candidates(afl, q, k, candidates, cand_count, cost)) {
+    if (vp_apply_runtime_site_candidates(afl, q, k, candidates, cand_count,
+                                         cost)) {
 
       improved = 1;
 

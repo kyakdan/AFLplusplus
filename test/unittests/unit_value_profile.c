@@ -167,9 +167,27 @@ static void test_non_stagnation_mode_is_noop(void **state) {
 static void setup_vp_frontier(afl_state_t *afl, u32 slots);
 static void free_vp_frontier(afl_state_t *afl);
 
+static inline size_t vp_test_slot_replicas(afl_state_t *afl) {
+
+  return afl->value_profile_source == VP_SOURCE_RUNTIME_SHM
+             ? VP_RUNTIME_SLOT_REPLICA_LIMIT
+             : 1U;
+
+}
+
 static inline size_t vp_test_frontier_idx(afl_state_t *afl, u32 site, u32 rel) {
 
-  return (size_t)site * afl->value_profile_slots + rel;
+  return (size_t)site * afl->value_profile_slots * vp_test_slot_replicas(afl) +
+         rel;
+
+}
+
+static inline size_t vp_test_runtime_frontier_idx(afl_state_t *afl, u32 site,
+                                                  u32 slot_rel, u32 replica) {
+
+  return vp_test_frontier_idx(afl, site,
+                              slot_rel * VP_RUNTIME_SLOT_REPLICA_LIMIT +
+                                  replica);
 
 }
 
@@ -309,7 +327,7 @@ static void test_solved_rtn_compare_does_not_consume_vp_bits(void **state) {
 
 static void setup_vp_frontier(afl_state_t *afl, u32 slots) {
 
-  size_t n = (size_t)CMP_MAP_W * slots;
+  size_t n = (size_t)CMP_MAP_W * slots * vp_test_slot_replicas(afl);
   afl->value_profile_level = 1;
   afl->value_profile_slots = slots;
   afl->top_rated_vp = calloc(CMP_MAP_W, sizeof(struct queue_entry *));
@@ -425,8 +443,8 @@ static void test_runtime_frontier_keeps_separate_metric_tags(void **state) {
   assert_true(vp_frontier_would_improve(&afl));
   vp_frontier_apply(&afl, &q);
 
-  idx0 = vp_test_frontier_idx(&afl, site, 0);
-  idx1 = vp_test_frontier_idx(&afl, site, 1);
+  idx0 = vp_test_runtime_frontier_idx(&afl, site, 0, 0);
+  idx1 = vp_test_runtime_frontier_idx(&afl, site, 1, 0);
   assert_ptr_equal(afl.vp_frontier[idx0].owner, &q);
   assert_ptr_equal(afl.vp_frontier[idx1].owner, &q);
   assert_int_equal(afl.vp_frontier[idx0].tag, 8);
@@ -442,20 +460,25 @@ static void test_runtime_frontier_keeps_separate_metric_tags(void **state) {
 
 }
 
-static void test_runtime_frontier_keeps_same_tag_overflow_slot(void **state) {
+static void test_runtime_frontier_keeps_best_replicas_per_slot(void **state) {
 
   (void)state;
 
   afl_state_t        afl;
   vp_map_t          *vp;
-  struct queue_entry q;
+  struct queue_entry q[5];
   u32                site = 29;
-  size_t             idx0, idx1;
+  u32                dist[5] = {25, 20, 15, 10, 30};
+  size_t             idx[VP_RUNTIME_SLOT_REPLICA_LIMIT];
 
   memset(&afl, 0, sizeof(afl));
   memset(&q, 0, sizeof(q));
-  q.exec_us = 7;
-  q.len = 13;
+  for (u32 i = 0; i < 5; ++i) {
+
+    q[i].exec_us = 7 + i;
+    q[i].len = 13 + i;
+
+  }
 
   vp = calloc(1, sizeof(vp_map_t));
   assert_non_null(vp);
@@ -471,29 +494,45 @@ static void test_runtime_frontier_keeps_same_tag_overflow_slot(void **state) {
   vp->enabled = 1;
   vp->control_len = 1;
   vp->control[0] = (u16)site;
-  vp->site[site].valid_mask = 0x3;
+  vp->site[site].valid_mask = 0x1;
   vp->site[site].protected_mask = 0x1;
-  vp->site[site].touched_mask = 0x3;
-  /* Protected home slot plus same-key overflow slot. */
+  vp->site[site].touched_mask = 0x1;
   vp->site[site].slots[0].slot_key = 0;
-  vp->site[site].slots[0].best_dist = 21;
-  vp->site[site].slots[1].slot_key = 0;
-  vp->site[site].slots[1].best_dist = 26;
 
-  assert_true(vp_frontier_would_improve(&afl));
-  vp_frontier_apply(&afl, &q);
+  for (u32 i = 0; i < 5; ++i) {
 
-  idx0 = vp_test_frontier_idx(&afl, site, 0);
-  idx1 = vp_test_frontier_idx(&afl, site, 1);
-  assert_ptr_equal(afl.vp_frontier[idx0].owner, &q);
-  assert_ptr_equal(afl.vp_frontier[idx1].owner, &q);
-  assert_int_equal(afl.vp_frontier[idx0].tag, 0);
-  assert_int_equal(afl.vp_frontier[idx0].dist, 21);
-  assert_int_equal(afl.vp_frontier[idx1].tag, 0);
-  assert_int_equal(afl.vp_frontier[idx1].dist, 26);
-  assert_int_equal(q.vp_ref_cnt, 2);
-  assert_ptr_equal(afl.top_rated_vp[site], &q);
-  assert_int_equal(afl.top_rated_vp_dist[site], 21);
+    vp->exec_id = i + 1;
+    vp->site[site].touched_mask = 0x1;
+    vp->site[site].slots[0].best_dist = dist[i];
+    assert_true(vp_frontier_would_improve(&afl) || i == 4);
+    vp_frontier_apply(&afl, &q[i]);
+
+  }
+
+  for (u32 i = 0; i < VP_RUNTIME_SLOT_REPLICA_LIMIT; ++i) {
+
+    idx[i] = vp_test_runtime_frontier_idx(&afl, site, 0, i);
+
+  }
+
+  assert_ptr_equal(afl.vp_frontier[idx[0]].owner, &q[0]);
+  assert_ptr_equal(afl.vp_frontier[idx[1]].owner, &q[1]);
+  assert_ptr_equal(afl.vp_frontier[idx[2]].owner, &q[2]);
+  assert_ptr_equal(afl.vp_frontier[idx[3]].owner, &q[3]);
+  for (u32 i = 0; i < VP_RUNTIME_SLOT_REPLICA_LIMIT; ++i) {
+
+    assert_int_equal(afl.vp_frontier[idx[i]].tag, 0);
+    assert_true(afl.vp_frontier[idx[i]].is_protected);
+
+  }
+
+  assert_int_equal(q[0].vp_ref_cnt, 1);
+  assert_int_equal(q[1].vp_ref_cnt, 1);
+  assert_int_equal(q[2].vp_ref_cnt, 1);
+  assert_int_equal(q[3].vp_ref_cnt, 1);
+  assert_int_equal(q[4].vp_ref_cnt, 0);
+  assert_ptr_equal(afl.top_rated_vp[site], &q[3]);
+  assert_int_equal(afl.top_rated_vp_dist[site], 10);
 
   free_vp_frontier(&afl);
   free(vp);
@@ -551,7 +590,7 @@ static void test_runtime_frontier_keeps_three_scalar_hit_pairs(void **state) {
 
   for (u32 i = 0; i < 6; ++i) {
 
-    size_t idx = vp_test_frontier_idx(&afl, site, i);
+    size_t idx = vp_test_runtime_frontier_idx(&afl, site, i, 0);
     assert_ptr_equal(afl.vp_frontier[idx].owner, &q);
     assert_int_equal(afl.vp_frontier[idx].tag, i);
     assert_true(afl.vp_frontier[idx].is_protected);
@@ -567,46 +606,46 @@ static void test_runtime_frontier_keeps_three_scalar_hit_pairs(void **state) {
 
 }
 
-static void test_l1_favoring_marks_only_protected_slots(void **state) {
+static void test_l1_favoring_marks_best_entry_per_runtime_slot(void **state) {
 
   (void)state;
 
   afl_state_t         afl;
-  struct queue_entry  q_protected0, q_overflow, q_protected1;
+  struct queue_entry  q_best0, q_other0, q_best1;
   u32                 site0 = 5, site1 = 9;
   size_t              idx0, idx1, idx2;
 
   memset(&afl, 0, sizeof(afl));
-  memset(&q_protected0, 0, sizeof(q_protected0));
-  memset(&q_overflow, 0, sizeof(q_overflow));
-  memset(&q_protected1, 0, sizeof(q_protected1));
+  memset(&q_best0, 0, sizeof(q_best0));
+  memset(&q_other0, 0, sizeof(q_other0));
+  memset(&q_best1, 0, sizeof(q_best1));
   afl.smallest_favored = -1;
   afl.value_profile_mode = 1;
   afl.value_profile_active = 1;
   afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
   setup_vp_frontier(&afl, 4);
 
-  q_protected0.id = 10;
-  q_overflow.id = 20;
-  q_protected1.id = 30;
+  q_best0.id = 10;
+  q_other0.id = 20;
+  q_best1.id = 30;
 
-  idx0 = vp_test_frontier_idx(&afl, site0, 0);
-  idx1 = vp_test_frontier_idx(&afl, site0, 1);
-  idx2 = vp_test_frontier_idx(&afl, site1, 0);
+  idx0 = vp_test_runtime_frontier_idx(&afl, site0, 0, 0);
+  idx1 = vp_test_runtime_frontier_idx(&afl, site0, 0, 1);
+  idx2 = vp_test_runtime_frontier_idx(&afl, site1, 0, 0);
 
-  afl.vp_frontier[idx0].owner = &q_protected0;
+  afl.vp_frontier[idx0].owner = &q_best0;
   afl.vp_frontier[idx0].tag = 1;
   afl.vp_frontier[idx0].dist = 7;
   afl.vp_frontier[idx0].cost = 100;
   afl.vp_frontier[idx0].is_protected = 1;
 
-  afl.vp_frontier[idx1].owner = &q_overflow;
+  afl.vp_frontier[idx1].owner = &q_other0;
   afl.vp_frontier[idx1].tag = 1;
   afl.vp_frontier[idx1].dist = 9;
   afl.vp_frontier[idx1].cost = 200;
   afl.vp_frontier[idx1].is_protected = 0;
 
-  afl.vp_frontier[idx2].owner = &q_protected1;
+  afl.vp_frontier[idx2].owner = &q_best1;
   afl.vp_frontier[idx2].tag = 2;
   afl.vp_frontier[idx2].dist = 5;
   afl.vp_frontier[idx2].cost = 300;
@@ -614,9 +653,9 @@ static void test_l1_favoring_marks_only_protected_slots(void **state) {
 
   vp_mark_favored_runtime_slots(&afl);
 
-  assert_true(q_protected0.favored);
-  assert_false(q_overflow.favored);
-  assert_true(q_protected1.favored);
+  assert_true(q_best0.favored);
+  assert_false(q_other0.favored);
+  assert_true(q_best1.favored);
   assert_int_equal(afl.queued_favored, 2);
   assert_int_equal(afl.pending_favored, 2);
   assert_int_equal(afl.smallest_favored, 10);
@@ -625,7 +664,7 @@ static void test_l1_favoring_marks_only_protected_slots(void **state) {
 
 }
 
-static void test_runtime_frontier_prefers_protected_same_tag_on_equal_dist(
+static void test_runtime_frontier_retains_protected_same_tag_on_equal_dist(
     void **state) {
 
   (void)state;
@@ -634,7 +673,7 @@ static void test_runtime_frontier_prefers_protected_same_tag_on_equal_dist(
   vp_map_t           *vp;
   struct queue_entry  q_overflow, q_home;
   u32                 site = 37;
-  size_t              idx;
+  size_t              idx0, idx1;
 
   memset(&afl, 0, sizeof(afl));
   memset(&q_overflow, 0, sizeof(q_overflow));
@@ -667,9 +706,9 @@ static void test_runtime_frontier_prefers_protected_same_tag_on_equal_dist(
   assert_true(vp_frontier_would_improve(&afl));
   vp_frontier_apply(&afl, &q_overflow);
 
-  idx = vp_test_frontier_idx(&afl, site, 0);
-  assert_ptr_equal(afl.vp_frontier[idx].owner, &q_overflow);
-  assert_false(afl.vp_frontier[idx].is_protected);
+  idx0 = vp_test_runtime_frontier_idx(&afl, site, 0, 0);
+  assert_ptr_equal(afl.vp_frontier[idx0].owner, &q_overflow);
+  assert_false(afl.vp_frontier[idx0].is_protected);
 
   vp->exec_id = 2;
   vp->site[site].touched_mask = 0x1;
@@ -680,9 +719,12 @@ static void test_runtime_frontier_prefers_protected_same_tag_on_equal_dist(
   assert_true(vp_frontier_would_improve(&afl));
   vp_frontier_apply(&afl, &q_home);
 
-  assert_ptr_equal(afl.vp_frontier[idx].owner, &q_home);
-  assert_true(afl.vp_frontier[idx].is_protected);
-  assert_int_equal(q_overflow.vp_ref_cnt, 0);
+  idx1 = vp_test_runtime_frontier_idx(&afl, site, 0, 1);
+  assert_ptr_equal(afl.vp_frontier[idx0].owner, &q_overflow);
+  assert_false(afl.vp_frontier[idx0].is_protected);
+  assert_ptr_equal(afl.vp_frontier[idx1].owner, &q_home);
+  assert_true(afl.vp_frontier[idx1].is_protected);
+  assert_int_equal(q_overflow.vp_ref_cnt, 1);
   assert_int_equal(q_home.vp_ref_cnt, 1);
 
   free_vp_frontier(&afl);
@@ -750,6 +792,72 @@ static void test_runtime_trim_guard_preserve_and_regress(void **state) {
   vp->site[site].slots[0].slot_key = 7;
   vp->site[site].slots[0].best_dist = 6;
   assert_false(vp_trim_guard_preserved(guard, NULL, 0, 0, 0));
+  vp_trim_guard_after_exec(guard);
+
+  vp_trim_guard_destroy(guard);
+  free_vp_frontier(&afl);
+  free(vp);
+
+}
+
+static void test_runtime_trim_guard_distinguishes_runtime_slots(void **state) {
+
+  (void)state;
+
+  afl_state_t        afl;
+  struct queue_entry q;
+  vp_map_t          *vp;
+  vp_trim_guard_t   *guard;
+  u32                site = 41;
+  size_t             idx0, idx1;
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q, 0, sizeof(q));
+  vp = calloc(1, sizeof(vp_map_t));
+  assert_non_null(vp);
+
+  afl.value_profile_mode = 1;
+  afl.value_profile_active = 1;
+  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
+  afl.shm.vp_map = vp;
+  setup_vp_frontier(&afl, 2);
+
+  q.vp_ref_cnt = 2;
+  q.exec_us = 3;
+  q.len = 9;
+  idx0 = vp_test_runtime_frontier_idx(&afl, site, 0, 0);
+  idx1 = vp_test_runtime_frontier_idx(&afl, site, 1, 0);
+  afl.vp_frontier[idx0].owner = &q;
+  afl.vp_frontier[idx0].dist = 5;
+  afl.vp_frontier[idx0].tag = 7;
+  afl.vp_frontier[idx0].cost = 100;
+  afl.vp_frontier[idx1].owner = &q;
+  afl.vp_frontier[idx1].dist = 5;
+  afl.vp_frontier[idx1].tag = 7;
+  afl.vp_frontier[idx1].cost = 100;
+
+  vp->enabled = 1;
+  vp->exec_id = 4;
+
+  guard = vp_trim_guard_init(&afl, &q);
+  assert_non_null(guard);
+
+  vp_trim_guard_before_exec(guard);
+  vp->site[site].valid_mask = 0x1;
+  vp->site[site].touched_mask = 0x1;
+  vp->site[site].slots[0].slot_key = 7;
+  vp->site[site].slots[0].best_dist = 4;
+  assert_false(vp_trim_guard_preserved(guard, NULL, 0, 0, 0));
+  vp_trim_guard_after_exec(guard);
+
+  vp_trim_guard_before_exec(guard);
+  vp->site[site].valid_mask = 0x3;
+  vp->site[site].touched_mask = 0x3;
+  vp->site[site].slots[0].slot_key = 7;
+  vp->site[site].slots[0].best_dist = 4;
+  vp->site[site].slots[1].slot_key = 7;
+  vp->site[site].slots[1].best_dist = 4;
+  assert_true(vp_trim_guard_preserved(guard, NULL, 0, 0, 0));
   vp_trim_guard_after_exec(guard);
 
   vp_trim_guard_destroy(guard);
@@ -946,12 +1054,13 @@ int main(int argc, char **argv) {
       cmocka_unit_test(test_solved_rtn_compare_does_not_consume_vp_bits),
       cmocka_unit_test(test_runtime_frontier_update_with_overflow_scan),
       cmocka_unit_test(test_runtime_frontier_keeps_separate_metric_tags),
-      cmocka_unit_test(test_runtime_frontier_keeps_same_tag_overflow_slot),
+      cmocka_unit_test(test_runtime_frontier_keeps_best_replicas_per_slot),
       cmocka_unit_test(test_runtime_frontier_keeps_three_scalar_hit_pairs),
-      cmocka_unit_test(test_l1_favoring_marks_only_protected_slots),
+      cmocka_unit_test(test_l1_favoring_marks_best_entry_per_runtime_slot),
       cmocka_unit_test(
-          test_runtime_frontier_prefers_protected_same_tag_on_equal_dist),
+          test_runtime_frontier_retains_protected_same_tag_on_equal_dist),
       cmocka_unit_test(test_runtime_trim_guard_preserve_and_regress),
+      cmocka_unit_test(test_runtime_trim_guard_distinguishes_runtime_slots),
       cmocka_unit_test(test_cmplog_inline_trim_guard_preserve_and_regress),
       cmocka_unit_test(test_cmplog_child_trim_guard_preserve_and_regress),
       cmocka_unit_test(test_trim_deferred_cleared_on_last_ref_drop)};
