@@ -591,6 +591,45 @@ static inline size_t vp_runtime_slot_base(afl_state_t *afl, u32 site,
 
 }
 
+static inline u8 vp_runtime_frontier_entry_is_favor_candidate(
+    const vp_frontier_entry_t *entry) {
+
+  struct queue_entry *q = entry->owner;
+  return q && !q->disabled && entry->dist && entry->dist < VP_DIST_UNSOLVED;
+
+}
+
+static inline void vp_runtime_slot_mask_recompute(afl_state_t *afl, u32 site,
+                                                  u16 slot_rel) {
+
+  if (unlikely(!afl->vp_runtime_slot_mask)) return;
+
+  u8 has_favor_candidate = 0;
+  for (u16 replica = 0; replica < VP_RUNTIME_SLOT_REPLICA_LIMIT; ++replica) {
+
+    size_t idx = vp_runtime_slot_base(afl, site, slot_rel) + replica;
+    if (vp_runtime_frontier_entry_is_favor_candidate(&afl->vp_frontier[idx])) {
+
+      has_favor_candidate = 1;
+      break;
+
+    }
+
+  }
+
+  u16 bit = (u16)(1U << slot_rel);
+  if (has_favor_candidate) {
+
+    afl->vp_runtime_slot_mask[site] |= bit;
+
+  } else {
+
+    afl->vp_runtime_slot_mask[site] &= (u16)~bit;
+
+  }
+
+}
+
 /* Cost tie-breaker used for equal-distance frontier candidates. */
 static inline u64 vp_entry_cost(const struct queue_entry *q) {
 
@@ -668,6 +707,16 @@ static inline void vp_clear_slot(afl_state_t *afl, size_t idx) {
   afl->vp_frontier[idx].tag = 0;
   afl->vp_frontier[idx].cost = ~(u64)0;
   afl->vp_frontier[idx].is_protected = 0;
+
+  if (afl->value_profile_source == VP_SOURCE_RUNTIME_SHM &&
+      afl->vp_runtime_slot_mask) {
+
+    size_t site_span = vp_frontier_site_span(afl);
+    u32    site = (u32)(idx / site_span);
+    u16 slot_rel = (u16)(((idx % site_span) / VP_RUNTIME_SLOT_REPLICA_LIMIT));
+    vp_runtime_slot_mask_recompute(afl, site, slot_rel);
+
+  }
 
 }
 
@@ -801,9 +850,22 @@ void vp_mark_favored_runtime_slots(afl_state_t *afl) {
       afl->value_profile_source != VP_SOURCE_RUNTIME_SHM)
     return;
 
+  u16 slot_cfg_mask = afl->value_profile_slots == 16
+                          ? 0xffffU
+                          : (u16)((1U << afl->value_profile_slots) - 1U);
+
   for (u32 site = 0; site < CMP_MAP_W; ++site) {
 
-    for (u16 slot_rel = 0; slot_rel < afl->value_profile_slots; ++slot_rel) {
+    u16 slot_mask = afl->vp_runtime_slot_mask ? afl->vp_runtime_slot_mask[site]
+                                              : slot_cfg_mask;
+    slot_mask &= slot_cfg_mask;
+
+    for (u16 bits = slot_mask; bits; bits = (u16)(bits & (bits - 1U))) {
+
+      u16    slot_rel = (u16)__builtin_ctz((u32)bits);
+      u16    slot_bit = (u16)(1U << slot_rel);
+      u8     has_favor_candidate = 0;
+      size_t slot_base = vp_runtime_slot_base(afl, site, slot_rel);
 
       u8 used = 0;
       for (u16 pick = 0; pick < VP_RUNTIME_SLOT_FAVOR_LIMIT; ++pick) {
@@ -814,12 +876,14 @@ void vp_mark_favored_runtime_slots(afl_state_t *afl) {
 
           if (used & (1U << replica)) continue;
 
-          size_t idx = vp_runtime_slot_base(afl, site, slot_rel) + replica;
+          size_t               idx = slot_base + replica;
           vp_frontier_entry_t *entry = &afl->vp_frontier[idx];
           struct queue_entry  *q = entry->owner;
           if (!q || q->disabled || entry->dist == 0 ||
               entry->dist >= VP_DIST_UNSOLVED)
             continue;
+
+          has_favor_candidate = 1;
 
           if (best_idx == SIZE_MAX ||
               vp_runtime_entry_precedes(
@@ -835,8 +899,7 @@ void vp_mark_favored_runtime_slots(afl_state_t *afl) {
         }
 
         if (best_idx == SIZE_MAX) break;
-        used |=
-            1U << (u16)(best_idx - vp_runtime_slot_base(afl, site, slot_rel));
+        used |= 1U << (u16)(best_idx - slot_base);
 
         struct queue_entry *q = afl->vp_frontier[best_idx].owner;
         if (!q || q->disabled || q->favored) continue;
@@ -855,6 +918,13 @@ void vp_mark_favored_runtime_slots(afl_state_t *afl) {
           }
 
         }
+
+      }
+
+      if (afl->vp_runtime_slot_mask && !has_favor_candidate) {
+
+        /* Self-heal stale bits when owners were disabled outside VP paths. */
+        afl->vp_runtime_slot_mask[site] &= (u16)~slot_bit;
 
       }
 
@@ -885,6 +955,8 @@ static inline size_t vp_frontier_site_abs_idx(const vp_frontier_site_ctx_t *ctx,
 typedef struct {
 
   size_t base;                 /* First replica index for this runtime slot */
+  u32    site;                 /* Compare site index                        */
+  u16    slot_rel;             /* Runtime slot index within site            */
   u16    replicas;             /* Replica count per runtime slot            */
   s32    first_empty_rel;      /* First empty replica, else -1              */
   s32    worst_rel;            /* Worst retained replica, else -1           */
@@ -921,6 +993,7 @@ static inline void vp_frontier_runtime_slot_ctx_recompute(
   ctx->worst_dist = 0;
   ctx->worst_cost = 0;
   ctx->worst_is_protected = 0;
+  u8 has_favor_candidate = 0;
 
   for (u16 rel_idx = 0; rel_idx < ctx->replicas; ++rel_idx) {
 
@@ -936,6 +1009,8 @@ static inline void vp_frontier_runtime_slot_ctx_recompute(
 
     }
 
+    if (dist != 0) { has_favor_candidate = 1; }
+
     if (ctx->worst_rel < 0 ||
         vp_runtime_entry_precedes(ctx->worst_dist, ctx->worst_cost,
                                   ctx->worst_is_protected, dist, entry->cost,
@@ -950,6 +1025,21 @@ static inline void vp_frontier_runtime_slot_ctx_recompute(
 
   }
 
+  if (afl->vp_runtime_slot_mask) {
+
+    u16 bit = (u16)(1U << ctx->slot_rel);
+    if (has_favor_candidate) {
+
+      afl->vp_runtime_slot_mask[ctx->site] |= bit;
+
+    } else {
+
+      afl->vp_runtime_slot_mask[ctx->site] &= (u16)~bit;
+
+    }
+
+  }
+
 }
 
 static inline void vp_frontier_runtime_slot_ctx_init(
@@ -957,6 +1047,8 @@ static inline void vp_frontier_runtime_slot_ctx_init(
     vp_frontier_runtime_slot_ctx_t *ctx) {
 
   ctx->base = vp_runtime_slot_base(afl, site, slot_rel);
+  ctx->site = site;
+  ctx->slot_rel = slot_rel;
   ctx->replicas = VP_RUNTIME_SLOT_REPLICA_LIMIT;
 
   if (clear_stale) {

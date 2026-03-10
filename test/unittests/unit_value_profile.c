@@ -353,6 +353,7 @@ static void setup_vp_frontier(afl_state_t *afl, u32 slots) {
 static void free_vp_frontier(afl_state_t *afl) {
 
   free(afl->vp_frontier);
+  free(afl->vp_runtime_slot_mask);
   free(afl->top_rated_vp_dist);
   free(afl->top_rated_vp);
 
@@ -659,6 +660,101 @@ static void test_l1_favoring_marks_best_entry_per_runtime_slot(void **state) {
   assert_int_equal(afl.queued_favored, 2);
   assert_int_equal(afl.pending_favored, 2);
   assert_int_equal(afl.smallest_favored, 10);
+
+  free_vp_frontier(&afl);
+
+}
+
+static void test_l1_favoring_uses_runtime_slot_mask(void **state) {
+
+  (void)state;
+
+  afl_state_t        afl;
+  struct queue_entry q_masked, q_unmasked;
+  u32                site_masked = 13, site_unmasked = 17;
+  size_t             idx_masked, idx_unmasked;
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q_masked, 0, sizeof(q_masked));
+  memset(&q_unmasked, 0, sizeof(q_unmasked));
+  afl.smallest_favored = -1;
+  afl.value_profile_mode = 1;
+  afl.value_profile_active = 1;
+  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
+  setup_vp_frontier(&afl, 4);
+  afl.vp_runtime_slot_mask = calloc(CMP_MAP_W, sizeof(u16));
+  assert_non_null(afl.vp_runtime_slot_mask);
+
+  q_masked.id = 10;
+  q_unmasked.id = 20;
+
+  idx_masked = vp_test_runtime_frontier_idx(&afl, site_masked, 0, 0);
+  idx_unmasked = vp_test_runtime_frontier_idx(&afl, site_unmasked, 0, 0);
+
+  afl.vp_frontier[idx_masked].owner = &q_masked;
+  afl.vp_frontier[idx_masked].tag = 1;
+  afl.vp_frontier[idx_masked].dist = 7;
+  afl.vp_frontier[idx_masked].cost = 100;
+  afl.vp_frontier[idx_masked].is_protected = 1;
+
+  afl.vp_frontier[idx_unmasked].owner = &q_unmasked;
+  afl.vp_frontier[idx_unmasked].tag = 2;
+  afl.vp_frontier[idx_unmasked].dist = 5;
+  afl.vp_frontier[idx_unmasked].cost = 90;
+  afl.vp_frontier[idx_unmasked].is_protected = 1;
+
+  /* Sparse scanner should consider only masked runtime slots. */
+  afl.vp_runtime_slot_mask[site_masked] = 1U;
+
+  vp_mark_favored_runtime_slots(&afl);
+
+  assert_true(q_masked.favored);
+  assert_false(q_unmasked.favored);
+  assert_int_equal(afl.queued_favored, 1);
+  assert_int_equal(afl.pending_favored, 1);
+  assert_int_equal(afl.smallest_favored, 10);
+
+  free_vp_frontier(&afl);
+
+}
+
+static void test_l1_runtime_slot_mask_clears_stale_external_disable(
+    void **state) {
+
+  (void)state;
+
+  afl_state_t        afl;
+  struct queue_entry q;
+  u32                site = 13;
+  size_t             idx;
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q, 0, sizeof(q));
+  afl.smallest_favored = -1;
+  afl.value_profile_mode = 1;
+  afl.value_profile_active = 1;
+  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
+  setup_vp_frontier(&afl, 4);
+  afl.vp_runtime_slot_mask = calloc(CMP_MAP_W, sizeof(u16));
+  assert_non_null(afl.vp_runtime_slot_mask);
+
+  idx = vp_test_runtime_frontier_idx(&afl, site, 0, 0);
+  afl.vp_frontier[idx].owner = &q;
+  afl.vp_frontier[idx].tag = 1;
+  afl.vp_frontier[idx].dist = 7;
+  afl.vp_frontier[idx].cost = 100;
+  afl.vp_frontier[idx].is_protected = 1;
+  afl.vp_runtime_slot_mask[site] = 1U;
+
+  /* Simulate disable from a non-VP path (for example redundant disabling). */
+  q.disabled = 1;
+
+  vp_mark_favored_runtime_slots(&afl);
+
+  assert_false(q.favored);
+  assert_int_equal(afl.vp_runtime_slot_mask[site], 0U);
+  assert_int_equal(afl.queued_favored, 0);
+  assert_int_equal(afl.pending_favored, 0);
 
   free_vp_frontier(&afl);
 
@@ -1057,6 +1153,9 @@ int main(int argc, char **argv) {
       cmocka_unit_test(test_runtime_frontier_keeps_best_replicas_per_slot),
       cmocka_unit_test(test_runtime_frontier_keeps_three_scalar_hit_pairs),
       cmocka_unit_test(test_l1_favoring_marks_best_entry_per_runtime_slot),
+      cmocka_unit_test(test_l1_favoring_uses_runtime_slot_mask),
+      cmocka_unit_test(
+          test_l1_runtime_slot_mask_clears_stale_external_disable),
       cmocka_unit_test(
           test_runtime_frontier_retains_protected_same_tag_on_equal_dist),
       cmocka_unit_test(test_runtime_trim_guard_preserve_and_regress),

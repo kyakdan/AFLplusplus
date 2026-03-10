@@ -2009,6 +2009,12 @@ int main(int argc, char **argv_orig, char **envp) {
         (size_t)CMP_MAP_W * afl->value_profile_slots * vp_slot_replicas;
     afl->vp_frontier =
         ck_alloc(vp_frontier_slots * sizeof(vp_frontier_entry_t));
+    if (afl->value_profile_source == VP_SOURCE_RUNTIME_SHM) {
+
+      afl->vp_runtime_slot_mask = ck_alloc(CMP_MAP_W * sizeof(u16));
+
+    }
+
     for (size_t i = 0; i < vp_frontier_slots; ++i) {
 
       afl->vp_frontier[i].dist = VP_DIST_UNSOLVED;

@@ -870,6 +870,8 @@ typedef struct afl_state {
   struct queue_entry **top_rated_vp;   /* Best entry per CMP site (by dist) */
   u32 *top_rated_vp_dist;              /* Per-site best distance            */
   vp_frontier_entry_t *vp_frontier;    /* Frontier slots                    */
+  u16                 *vp_runtime_slot_mask; /* Per-site runtime slots with
+                                                favor candidates                  */
 
 /* Max real VP distance is 256; 257 means no candidate for this site. */
 #define VP_DIST_UNSOLVED 257U
