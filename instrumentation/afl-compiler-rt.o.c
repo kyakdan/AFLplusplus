@@ -293,7 +293,8 @@ vp_map_t       *__afl_vp_map;
 vp_map_t       *__afl_vp_map_backup;
 
 static u8 __afl_cmplog_max_len = 32;  // 16-32
-static u8 __afl_vp_slots = 4;
+/* Keep runtime default aligned with afl-fuzz VP_SLOTS_DEFAULT. */
+static u8 __afl_vp_slots = VP_DEFAULT_SLOTS;
 
 /* Child pid? */
 

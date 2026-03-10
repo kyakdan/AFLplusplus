@@ -406,7 +406,7 @@ checks or alter some of the more exotic semantics of the tool:
         coverage, and disable again after edge coverage recovers (after at
         least one full queue cycle). If `-j` is omitted, level 1 is used.
     Additional tuning via environment variable:
-      - `AFL_VALUE_PROFILE_SLOTS=K` (default: `4`, valid: `1..16`) controls
+      - `AFL_VALUE_PROFILE_SLOTS=K` (default: `16`, valid: `1..16`) controls
         per-site frontier width for level 1 and is ignored for level 2.
     Value profiling may help when compare operands are transformed in ways
     that make direct solve attempts less effective.

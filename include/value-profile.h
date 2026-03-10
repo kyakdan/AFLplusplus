@@ -27,6 +27,7 @@
 #include "types.h"
 
 #define VP_MAP_W 65536U
+#define VP_DEFAULT_SLOTS 16U
 #define VP_MAX_SLOTS 16U
 #define VP_CONTROL_CAP VP_MAP_W
 
