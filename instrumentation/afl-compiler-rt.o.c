@@ -3264,20 +3264,54 @@ static inline void vp_runtime_record_rtn(u8 *ptr1, u8 *ptr2, u32 max_len,
 
   if (prefix_len == max_len) solved = 1;
 
-  u16 dist;
+  u16 prefix_dist;
+  u16 allbytes_dist;
   if (solved) {
 
-    dist = 0;
+    prefix_dist = 0;
+    allbytes_dist = 0;
 
   } else {
 
+    /* Metric 1: prefix-based (sequential gradient). */
     u32 rem = max_len - prefix_len;
     u32 first_diff_hamming = popcount_u8(ptr1[prefix_len] ^ ptr2[prefix_len]);
-    dist = (u16)(((rem - 1U) * 8U) + first_diff_hamming);
+    prefix_dist = (u16)(((rem - 1U) * 8U) + first_diff_hamming);
+
+    /* Metric 2: sum-of-hamming across ALL differing bytes.
+       Gives gradient for every byte, not just the first mismatch.
+       Range 1..256 for max_len up to 32 (32 * 8 = 256). */
+    u32 total_hamming = 0;
+    for (u32 i = prefix_len; i < max_len; ++i) {
+
+      if (stop_at_zero && (ptr1[i] == 0 || ptr2[i] == 0)) break;
+      total_hamming += popcount_u8(ptr1[i] ^ ptr2[i]);
+
+    }
+
+    allbytes_dist = (u16)(total_hamming > 0 ? total_hamming : 1);
 
   }
 
-  vp_runtime_record_dist(site, dist);
+  /* Record both metrics into adjacent slot pairs, mirroring the
+     dual-metric approach used by vp_runtime_record_scalar_dists
+     for INS compares. */
+  u16        slot_count = __afl_vp_slots;
+  vp_site_t *s = vp_runtime_prepare_site(vp, site);
+  u16        hit_ordinal = s->hit_count;
+  if (s->hit_count < 0xffffU) { ++s->hit_count; }
+
+  u16 preferred_start_slot =
+      vp_runtime_scalar_pair_start_slot(hit_ordinal, slot_count);
+  vp_runtime_store_dist(vp, site, s, slot_count,
+                        vp_runtime_metric_key(hit_ordinal, 0), prefix_dist,
+                        preferred_start_slot);
+
+  u16 next_start_slot =
+      slot_count == 1 ? 0 : (u16)((preferred_start_slot + 1U) % slot_count);
+  vp_runtime_store_dist(vp, site, s, slot_count,
+                        vp_runtime_metric_key(hit_ordinal, 1), allbytes_dist,
+                        next_start_slot);
 
 }
 
@@ -4575,3 +4609,4 @@ uint32_t ijon_memdist(char *a, char *b, size_t len) {
   }
 
 }
+

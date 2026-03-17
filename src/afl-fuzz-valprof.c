@@ -467,10 +467,15 @@ static inline u32 vp_site_hits(const struct cmp_header *hdr) {
      hamming ∈ [1,64],  abs_dist ∈ [1,64]  for ≤64-bit compares.
 
    RTN compares (memcmp/strcmp-like routines):
-     feature:  k * 256 + prefix_len * 8 + (first_diff_hamming - 1)
+     prefix   feature:  k * 512 + prefix_len * 8 + (first_diff_hamming - 1)
      prefix_len ∈ [0,31], first_diff_hamming ∈ [1,8]     offsets [0, 255]
+     allbytes feature:  k * 512 + 256 + (sum_of_hamming - 1)
+     sum_of_hamming ∈ [1,256]                             offsets [256, 511]
 
-   Max composite value: 65535 * 256 + 255 = 16,777,215, fits in u32. */
+   Max composite value: 65535 * 512 + 511 = 33,554,943, fits in u32. */
+
+static inline u32 vp_rtn_compare_dist_allbytes(const struct cmpfn_operands *rtn,
+                                               u32 max_len, u32 prefix_len);
 
 /* Compute value profile features from the current cmp_map.
    Check each feature against virgin_val_prof bitmap.
@@ -520,14 +525,24 @@ static inline u32 vp_check_cmpmap_site(struct cmp_map *cmp, u8 *virgin, u32 k) {
 
       }
 
-      /* Single feature per RTN compare: per-position hamming at full
-         resolution.  Each prefix advance opens 8 fresh feature slots.
-         Hashed via hash_fmix32 for uniform scattering. */
+      /* Feature 1: prefix-based — per-position hamming at full resolution.
+         Each prefix advance opens 8 fresh feature slots.
+         Uses k*512 stride to avoid overlap with allbytes feature. */
       u32 idx =
-          hash_fmix32(k * 256 + prefix_len * 8 + (first_diff_hamming - 1)) %
+          hash_fmix32(k * 512 + prefix_len * 8 + (first_diff_hamming - 1)) %
           (VALUE_PROFILE_MAP_SIZE * 8);
 
       new_bits += clear_virgin_bit(virgin, idx);
+
+      /* Feature 2: sum-of-hamming across all differing bytes.
+         Offset 256+ within the k*512 block, cleanly separated from
+         prefix offsets [0, 255]. */
+      u32 allbytes_dist =
+          vp_rtn_compare_dist_allbytes(&rtn[j], max_len, prefix_len);
+      u32 idx_a = hash_fmix32(k * 512 + 256 + (allbytes_dist - 1)) %
+                  (VALUE_PROFILE_MAP_SIZE * 8);
+
+      new_bits += clear_virgin_bit(virgin, idx_a);
 
     }
 
@@ -1319,14 +1334,31 @@ static inline u8 vp_frontier_site_apply_ctx(afl_state_t            *afl,
 
 }
 
-/* RTN distance metric for one compare hit: remaining suffix weight plus first
-   differing-byte hamming distance. */
+/* RTN distance metric 1: remaining suffix weight plus first
+   differing-byte hamming distance (sequential gradient). */
 static inline u32 vp_rtn_compare_dist(const struct cmpfn_operands *rtn,
                                       u32 max_len, u32 prefix_len) {
 
   u32 rem = max_len - prefix_len;
   return (rem - 1U) * 8U +
          popcount_u8(rtn->v0[prefix_len] ^ rtn->v1[prefix_len]);
+
+}
+
+/* RTN distance metric 2: sum of per-byte hamming distances across ALL
+   differing bytes.  Gives gradient signal for every byte position, not
+   just the first mismatch.  Range: 1..256 for max_len up to 32. */
+static inline u32 vp_rtn_compare_dist_allbytes(const struct cmpfn_operands *rtn,
+                                               u32 max_len, u32 prefix_len) {
+
+  u32 total = 0;
+  for (u32 i = prefix_len; i < max_len; ++i) {
+
+    total += popcount_u8(rtn->v0[i] ^ rtn->v1[i]);
+
+  }
+
+  return total > 0 ? total : 1;
 
 }
 
@@ -1374,9 +1406,13 @@ static inline u32 vp_collect_cmplog_site_candidates(struct cmp_map *cmp, u32 k,
       u32 max_len, prefix_len;
       if (analyze_rtn_compare(&rtn[j], &max_len, &prefix_len)) continue;
 
+      u32 prefix_d = vp_rtn_compare_dist(&rtn[j], max_len, prefix_len);
+      u32 allbytes_d =
+          vp_rtn_compare_dist_allbytes(&rtn[j], max_len, prefix_len);
+
       out[n].slot_rel = 0;
       out[n].tag = vp_rtn_compare_tag(max_len, ord_in_len_class);
-      out[n].dist = vp_rtn_compare_dist(&rtn[j], max_len, prefix_len);
+      out[n].dist = MIN(prefix_d, allbytes_d);
       out[n].is_protected = 0;
       ++n;
 

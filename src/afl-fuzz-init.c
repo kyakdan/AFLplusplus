@@ -2110,6 +2110,10 @@ static void handle_existing_out_dir(afl_state_t *afl) {
   if (delete_files(fn, "auto_")) { goto dir_cleanup_failed; }
   ck_free(fn);
 
+  fn = alloc_printf("%s/queue/.state/vp_taint", afl->out_dir);
+  if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
+  ck_free(fn);
+
   fn = alloc_printf("%s/queue/.state/redundant_edges", afl->out_dir);
   if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
   ck_free(fn);
@@ -2457,6 +2461,12 @@ void setup_dirs_fds(afl_state_t *afl) {
   /* Directory with the auto-selected dictionary entries. */
 
   tmp = alloc_printf("%s/queue/.state/auto_extras/", afl->out_dir);
+  if (mkdir(tmp, afl->dir_perm)) { PFATAL("Unable to create '%s'", tmp); }
+  ck_free(tmp);
+
+  /* Directory for persisted VP taint analysis results. */
+
+  tmp = alloc_printf("%s/queue/.state/vp_taint/", afl->out_dir);
   if (mkdir(tmp, afl->dir_perm)) { PFATAL("Unable to create '%s'", tmp); }
   ck_free(tmp);
 

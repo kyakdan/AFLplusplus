@@ -767,6 +767,9 @@ void add_to_queue(afl_state_t *afl, u8 *fname, u32 len, u8 passed_det) {
 
   q->skipdet_e = (struct skipdet_entry *)ck_alloc(sizeof(struct skipdet_entry));
 
+  /* Restore persisted VP taint state if available for this queue entry. */
+  vp_taint_load_state(afl, q);
+
 }
 
 /* Destroy the entire queue. */
@@ -790,6 +793,9 @@ void destroy_queue(afl_state_t *afl) {
       ck_free(q->skipdet_e);
 
     }
+
+    vp_taint_resume_free(q);
+    if (q->vp_taint) { vp_taint_free(q); }
 
     ck_free(q);
 

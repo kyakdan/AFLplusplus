@@ -259,6 +259,8 @@ struct skipdet_global {
 
 };
 
+typedef struct vp_taint_resume vp_taint_resume_t;
+
 struct queue_entry {
 
   u8 *fname;                            /* File name for the test case      */
@@ -322,7 +324,21 @@ struct queue_entry {
                       /*   1: explored                    */
   fs_meta_t *fs_meta;                   /* Frameshift metadata              */
 
+  /* VP taint analysis */
+  u32                   vp_taint_round; /* havoc rounds since last VP find  */
+  struct vp_taint_site *vp_taint;       /* per-site taint masks (list)      */
+  vp_taint_resume_t    *vp_taint_resume;
+
 };
+
+typedef struct vp_taint_site {
+
+  u16                   site_id;              /* VP site index              */
+  u32                   sensitive_cnt;        /* # of VP-sensitive bytes    */
+  u32                  *sensitive_positions;  /* byte offset array          */
+  struct vp_taint_site *next;
+
+} vp_taint_site_t;
 
 typedef struct {
 
@@ -883,6 +899,10 @@ typedef struct afl_state {
 #define VP_SLOTS_MAX VP_MAX_SLOTS
 #define VP_RUNTIME_SLOT_REPLICA_LIMIT 4U
 #define VP_RUNTIME_SLOT_FAVOR_LIMIT 1U
+#define VP_TAINT_MIN_RANGE 8U
+#define VP_TAINT_BIAS 80U             /* % chance to pick VP-sensitive byte */
+#define VP_TAINT_STAGNATION_THRESHOLD 0U         /* XXX: temp 0 for testing */
+#define AFL_VP_TAINT_TIMEOUT_MS (10 * 60 * 1000U)
 #define VP_SOURCE_NONE 0U
 #define VP_SOURCE_RUNTIME_SHM 1U
 #define VP_SOURCE_CMPLOG_INLINE 2U
@@ -1402,6 +1422,15 @@ u8   vp_collect_signal_for_input(afl_state_t *, u8 *, u32);
 u8   vp_run_cmplog(afl_state_t *, void *, u32);
 u8   vp_ensure_cmp_data_ready(afl_state_t *, void *, u32);
 void vp_prepare_exec(afl_state_t *, afl_forkserver_t *);
+
+/* VP taint analysis (afl-fuzz-vp-taint.c) */
+
+void vp_taint_analyze(afl_state_t *, struct queue_entry *);
+u8   vp_taint_site_owned(afl_state_t *, u16, struct queue_entry *);
+u32  vp_taint_rand_pos(afl_state_t *, vp_taint_site_t *, u32);
+void vp_taint_free(struct queue_entry *);
+void vp_taint_resume_free(struct queue_entry *);
+void vp_taint_load_state(afl_state_t *, struct queue_entry *);
 
 /* Extras */
 

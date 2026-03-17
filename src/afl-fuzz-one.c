@@ -349,6 +349,146 @@ static void locate_diffs(u8 *ptr1, u8 *ptr2, u32 len, s32 *first, s32 *last) {
 
 #endif                                                     /* !IGNORE_FINDS */
 
+/* VP-aware stacking policy shared by normal havoc and MOpt/splice-havoc.
+   Keep deep stacks for broad taint, and bias strongly toward 1-2 edits for
+   narrow taint to avoid clobbering near-solutions. */
+static inline u32 vp_adjust_use_stacking(afl_state_t *afl, u32 base_use,
+                                         const vp_taint_site_t *const vp_site) {
+
+  if (!vp_site || !vp_site->sensitive_cnt) return base_use;
+
+  u32 sensitive_cnt = vp_site->sensitive_cnt;
+  u32 use_stacking = base_use;
+
+  /* TODO(vp): benchmark and refine these bands/probabilities across targets.
+     Current values intentionally favor low-stack exploitation when taint is
+     narrow, while preserving occasional 3-4 edit jumps. */
+  if (sensitive_cnt <= 8) {
+
+    u32 r = rand_below(afl, 100);
+    if (r < 85) {
+
+      use_stacking = 1;
+
+    } else if (r < 98) {
+
+      use_stacking = 2;
+
+    } else {
+
+      use_stacking = 3 + rand_below(afl, 2);
+
+    }
+
+  } else if (sensitive_cnt <= 16) {
+
+    u32 r = rand_below(afl, 100);
+    if (r < 70) {
+
+      use_stacking = 1;
+
+    } else if (r < 95) {
+
+      use_stacking = 2;
+
+    } else {
+
+      use_stacking = 3 + rand_below(afl, 2);
+
+    }
+
+  } else {
+
+    /* Relaxed mode for broader taint: keep baseline randomness but cap worst
+       clobbering stacks. */
+    if (use_stacking > 8) use_stacking = 8;
+
+  }
+
+  return use_stacking;
+
+}
+
+static void vp_prepare_active_taint_sites(afl_state_t        *afl,
+                                          struct queue_entry *q,
+                                          u8                  splice_cycle,
+                                          vp_taint_site_t  ***out_sites,
+                                          u32                *out_cnt) {
+
+  *out_sites = NULL;
+  *out_cnt = 0;
+
+  u32 vp_taint_threshold = VP_TAINT_STAGNATION_THRESHOLD;
+  if (!splice_cycle && afl->value_profile_level == 1 && q->vp_ref_cnt > 0 &&
+      !q->vp_taint &&
+      (!vp_taint_threshold || q->vp_taint_round >= vp_taint_threshold)) {
+
+    vp_taint_analyze(afl, q);
+
+  }
+
+  if (!q->vp_taint) return;
+
+  for (vp_taint_site_t *node = q->vp_taint; node; node = node->next) {
+
+    if (node->sensitive_cnt > 0 && vp_taint_site_owned(afl, node->site_id, q)) {
+
+      vp_taint_site_t **tmp =
+          ck_realloc(*out_sites, (*out_cnt + 1U) * sizeof(vp_taint_site_t *));
+      *out_sites = tmp;
+      (*out_sites)[(*out_cnt)++] = node;
+
+    }
+
+  }
+
+}
+
+static u32 vp_build_sensitive_bitmap(afl_state_t *afl, struct queue_entry *q,
+                                     u32 len, u8 *map) {
+
+  if (!afl || !q || !q->vp_taint || !q->vp_ref_cnt || !len || !map) return 0;
+
+  u32 sensitive_cnt = 0;
+  for (vp_taint_site_t *node = q->vp_taint; node; node = node->next) {
+
+    if (!vp_taint_site_owned(afl, node->site_id, q)) continue;
+
+    for (u32 i = 0; i < node->sensitive_cnt; i++) {
+
+      u32 pos = node->sensitive_positions[i];
+      if (pos >= len || bitmap_read(map, pos)) continue;
+      bitmap_set(map, pos);
+      sensitive_cnt++;
+
+    }
+
+  }
+
+  /* Taint is computed once per entry while ownership can change over time.
+     If no currently-owned site contributes bytes, fall back to all stored
+     taint for this entry. */
+  if (!sensitive_cnt) {
+
+    for (vp_taint_site_t *node = q->vp_taint; node; node = node->next) {
+
+      for (u32 i = 0; i < node->sensitive_cnt; i++) {
+
+        u32 pos = node->sensitive_positions[i];
+        if (pos >= len || bitmap_read(map, pos)) continue;
+        bitmap_set(map, pos);
+        sensitive_cnt++;
+
+      }
+
+    }
+
+  }
+
+  return sensitive_cnt;
+
+}
+
 /* Take the current entry from the queue, fuzz it for a while. This
    function is a tad too long... returns 0 if fuzzed successfully, 1 if
    skipped or bailed out. */
@@ -364,8 +504,11 @@ u8 fuzz_one_original(afl_state_t *afl) {
 
   u8 ret_val = 1, doing_det = 0;
 
-  u8  a_collect[MAX_AUTO_EXTRA];
-  u32 a_len = 0;
+  u8                a_collect[MAX_AUTO_EXTRA];
+  u32               a_len = 0;
+  vp_taint_site_t **vp_taint_active_sites = NULL;
+  u32               vp_taint_active_cnt = 0;
+  u8               *vp_det_skip_eff_map = NULL;
 
   /* IJON: If we're doing IJON, skip deterministic stages and go directly to
    * havoc */
@@ -688,7 +831,38 @@ u8 fuzz_one_original(afl_state_t *afl) {
   u8 is_logged = 0;
 
 #endif
-  if (!afl->skip_deterministic) {
+  u8 *skip_eff_map = afl->queue_cur->skipdet_e->skip_eff_map;
+  u8  vp_det_use_vp_map = 0;
+
+  if (afl->value_profile_level == 1 && afl->queue_cur->favored &&
+      afl->queue_cur->vp_only && afl->queue_cur->vp_ref_cnt > 0 &&
+      afl->queue_cur->vp_taint) {
+
+    size_t skip_map_size = ((size_t)len + 7U) / 8U;
+    if (skip_map_size) {
+
+      vp_det_skip_eff_map = ck_alloc(skip_map_size);
+      u32 sensitive_cnt = vp_build_sensitive_bitmap(afl, afl->queue_cur, len,
+                                                    vp_det_skip_eff_map);
+
+      /* Broad taint falls back to regular skipdet analysis. */
+      if (sensitive_cnt && (u64)sensitive_cnt * 4U < (u64)len * 3U) {
+
+        vp_det_use_vp_map = 1;
+        skip_eff_map = vp_det_skip_eff_map;
+
+      } else {
+
+        ck_free(vp_det_skip_eff_map);
+        vp_det_skip_eff_map = NULL;
+
+      }
+
+    }
+
+  }
+
+  if (!afl->skip_deterministic && !vp_det_use_vp_map) {
 
     if (!skip_deterministic_stage(afl, in_buf, out_buf, len, before_det_time)) {
 
@@ -696,19 +870,20 @@ u8 fuzz_one_original(afl_state_t *afl) {
 
     }
 
-  }
+    skip_eff_map = afl->queue_cur->skipdet_e->skip_eff_map;
 
-  u8 *skip_eff_map = afl->queue_cur->skipdet_e->skip_eff_map;
+  }
 
   /* Skip right away if -d is given, if it has not been chosen sufficiently
      often to warrant the expensive deterministic stage (fuzz_level), or
      if it has gone through deterministic testing in earlier, resumed runs
      (passed_det). */
-  /* if skipdet decide to skip the seed or no interesting bytes found,
-     we skip the whole deterministic stage as well */
+  /* If skipdet skips this seed (or finds no effective bytes), skip the whole
+     deterministic stage. */
 
   if (likely(afl->skip_deterministic) || likely(afl->queue_cur->passed_det) ||
-      likely(!afl->queue_cur->skipdet_e->quick_eff_bytes) ||
+      likely(!vp_det_use_vp_map &&
+             !afl->queue_cur->skipdet_e->quick_eff_bytes) ||
       likely(perf_score <
              (afl->queue_cur->depth * 30 <= afl->havoc_max_mult * 100
                   ? afl->queue_cur->depth * 30
@@ -1959,6 +2134,13 @@ skip_extras:
   if (!afl->queue_cur->passed_det) { mark_as_det_done(afl, afl->queue_cur); }
 
 custom_mutator_stage:
+  if (vp_det_skip_eff_map) {
+
+    ck_free(vp_det_skip_eff_map);
+    vp_det_skip_eff_map = NULL;
+
+  }
+
   /*******************
    * CUSTOM MUTATORS *
    *******************/
@@ -2199,6 +2381,13 @@ havoc_stage:
 
   }
 
+  /* VP taint: trigger analysis if this entry has stagnated. */
+  vp_taint_site_t *vp_active_site = NULL;
+  u32              vp_saved_before = afl->queued_items;
+
+  vp_prepare_active_taint_sites(afl, afl->queue_cur, splice_cycle,
+                                &vp_taint_active_sites, &vp_taint_active_cnt);
+
   /* We essentially just do several thousand runs (depending on perf_score)
      where we take the input file and make random stacked tweaks. */
 
@@ -2288,6 +2477,17 @@ havoc_stage:
 
     u32 use_stacking = 1 + rand_below(afl, stack_max);
 
+    /* VP taint: pick active site via round-robin from precomputed list. */
+    vp_active_site = NULL;
+    if (vp_taint_active_cnt > 0) {
+
+      vp_active_site =
+          vp_taint_active_sites[afl->stage_cur % vp_taint_active_cnt];
+
+    }
+
+    use_stacking = vp_adjust_use_stacking(afl, use_stacking, vp_active_site);
+
     afl->stage_cur_val = use_stacking;
 
 #ifdef INTROSPECTION
@@ -2349,7 +2549,7 @@ havoc_stage:
 
           /* Flip a single bit somewhere. Spooky! */
           u8  bit = rand_below(afl, 8);
-          u32 off = rand_below(afl, temp_len);
+          u32 off = vp_taint_rand_pos(afl, vp_active_site, temp_len);
           out_buf[off] ^= 1 << bit;
 
 #ifdef INTROSPECTION
@@ -2369,7 +2569,8 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " INTERESTING8_%u", item);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          out_buf[rand_below(afl, temp_len)] = interesting_8[item];
+          out_buf[vp_taint_rand_pos(afl, vp_active_site, temp_len)] =
+              interesting_8[item];
           break;
 
         }
@@ -2386,7 +2587,8 @@ havoc_stage:
           strcat(afl->mutation, afl->m_tmp);
 #endif
 
-          *(u16 *)(out_buf + rand_below(afl, temp_len - 1)) =
+          *(u16 *)(out_buf +
+                   vp_taint_rand_pos(afl, vp_active_site, temp_len - 1)) =
               interesting_16[item];
 
           break;
@@ -2404,7 +2606,8 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " INTERESTING16BE_%u", item);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          *(u16 *)(out_buf + rand_below(afl, temp_len - 1)) =
+          *(u16 *)(out_buf +
+                   vp_taint_rand_pos(afl, vp_active_site, temp_len - 1)) =
               SWAP16(interesting_16[item]);
 
           break;
@@ -2423,7 +2626,8 @@ havoc_stage:
           strcat(afl->mutation, afl->m_tmp);
 #endif
 
-          *(u32 *)(out_buf + rand_below(afl, temp_len - 3)) =
+          *(u32 *)(out_buf +
+                   vp_taint_rand_pos(afl, vp_active_site, temp_len - 3)) =
               interesting_32[item];
 
           break;
@@ -2441,7 +2645,8 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " INTERESTING32BE_%u", item);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          *(u32 *)(out_buf + rand_below(afl, temp_len - 3)) =
+          *(u32 *)(out_buf +
+                   vp_taint_rand_pos(afl, vp_active_site, temp_len - 3)) =
               SWAP32(interesting_32[item]);
 
           break;
@@ -2457,7 +2662,7 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH8-_%u", item);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          out_buf[rand_below(afl, temp_len)] -= item;
+          out_buf[vp_taint_rand_pos(afl, vp_active_site, temp_len)] -= item;
           break;
 
         }
@@ -2471,7 +2676,7 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH8+_%u", item);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          out_buf[rand_below(afl, temp_len)] += item;
+          out_buf[vp_taint_rand_pos(afl, vp_active_site, temp_len)] += item;
           break;
 
         }
@@ -2482,7 +2687,7 @@ havoc_stage:
 
           if (unlikely(temp_len < 2)) { break; }  // no retry
 
-          u32 pos = rand_below(afl, temp_len - 1);
+          u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 1);
           item = 1 + rand_below(afl, ARITH_MAX);
 
 #ifdef INTROSPECTION
@@ -2501,7 +2706,7 @@ havoc_stage:
 
           if (unlikely(temp_len < 2)) { break; }  // no retry
 
-          u32 pos = rand_below(afl, temp_len - 1);
+          u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 1);
           u16 num = 1 + rand_below(afl, ARITH_MAX);
 
 #ifdef INTROSPECTION
@@ -2521,7 +2726,7 @@ havoc_stage:
 
           if (unlikely(temp_len < 2)) { break; }  // no retry
 
-          u32 pos = rand_below(afl, temp_len - 1);
+          u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 1);
           item = 1 + rand_below(afl, ARITH_MAX);
 
 #ifdef INTROSPECTION
@@ -2540,7 +2745,7 @@ havoc_stage:
 
           if (unlikely(temp_len < 2)) { break; }  // no retry
 
-          u32 pos = rand_below(afl, temp_len - 1);
+          u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 1);
           u16 num = 1 + rand_below(afl, ARITH_MAX);
 
 #ifdef INTROSPECTION
@@ -2560,7 +2765,7 @@ havoc_stage:
 
           if (unlikely(temp_len < 4)) { break; }  // no retry
 
-          u32 pos = rand_below(afl, temp_len - 3);
+          u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 3);
           item = 1 + rand_below(afl, ARITH_MAX);
 
 #ifdef INTROSPECTION
@@ -2579,7 +2784,7 @@ havoc_stage:
 
           if (unlikely(temp_len < 4)) { break; }  // no retry
 
-          u32 pos = rand_below(afl, temp_len - 3);
+          u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 3);
           u32 num = 1 + rand_below(afl, ARITH_MAX);
 
 #ifdef INTROSPECTION
@@ -2599,7 +2804,7 @@ havoc_stage:
 
           if (unlikely(temp_len < 4)) { break; }  // no retry
 
-          u32 pos = rand_below(afl, temp_len - 3);
+          u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 3);
           item = 1 + rand_below(afl, ARITH_MAX);
 
 #ifdef INTROSPECTION
@@ -2618,7 +2823,7 @@ havoc_stage:
 
           if (unlikely(temp_len < 4)) { break; }  // no retry
 
-          u32 pos = rand_below(afl, temp_len - 3);
+          u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 3);
           u32 num = 1 + rand_below(afl, ARITH_MAX);
 
 #ifdef INTROSPECTION
@@ -2638,7 +2843,7 @@ havoc_stage:
              why not. We use XOR with 1-255 to eliminate the
              possibility of a no-op. */
 
-          u32 pos = rand_below(afl, temp_len);
+          u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len);
           item = 1 + rand_below(afl, 255);
 #ifdef INTROSPECTION
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " RAND8_%u",
@@ -2831,7 +3036,7 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " BYTEADD_");
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          out_buf[rand_below(afl, temp_len)]++;
+          out_buf[vp_taint_rand_pos(afl, vp_active_site, temp_len)]++;
           break;
 
         }
@@ -2844,7 +3049,7 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " BYTESUB_");
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          out_buf[rand_below(afl, temp_len)]--;
+          out_buf[vp_taint_rand_pos(afl, vp_active_site, temp_len)]--;
           break;
 
         }
@@ -2857,7 +3062,7 @@ havoc_stage:
           snprintf(afl->m_tmp, sizeof(afl->m_tmp), " FLIP8_");
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          out_buf[rand_below(afl, temp_len)] ^= 0xff;
+          out_buf[vp_taint_rand_pos(afl, vp_active_site, temp_len)] ^= 0xff;
           break;
 
         }
@@ -3560,6 +3765,22 @@ havoc_stage:
 
   new_hit_cnt = afl->queued_items + afl->saved_crashes;
 
+  /* VP taint: track stagnation for this havoc visit. */
+  if (!splice_cycle && afl->value_profile_level == 1 &&
+      afl->queue_cur->vp_ref_cnt > 0) {
+
+    if (afl->queued_items == vp_saved_before) {
+
+      afl->queue_cur->vp_taint_round++;
+
+    } else {
+
+      afl->queue_cur->vp_taint_round = 0;
+
+    }
+
+  }
+
   if (!splice_cycle) {
 
     afl->stage_finds[STAGE_HAVOC] += new_hit_cnt - orig_hit_cnt;
@@ -3700,6 +3921,20 @@ retry_splicing:
 /* we are through with this queue entry - for this iteration */
 abandon_entry:
 
+  if (vp_det_skip_eff_map) {
+
+    ck_free(vp_det_skip_eff_map);
+    vp_det_skip_eff_map = NULL;
+
+  }
+
+  if (vp_taint_active_sites) {
+
+    ck_free(vp_taint_active_sites);
+    vp_taint_active_sites = NULL;
+
+  }
+
   /* IJON queue protection only - memory cleanup handled normally */
   if (unlikely(afl->is_doing_ijon)) {
 
@@ -3761,8 +3996,11 @@ static u8 mopt_common_fuzzing(afl_state_t *afl, MOpt_globals_t MOpt_globals) {
 
   u8 ret_val = 1, doing_det = 0;
 
-  u8  a_collect[MAX_AUTO_EXTRA];
-  u32 a_len = 0;
+  u8                a_collect[MAX_AUTO_EXTRA];
+  u32               a_len = 0;
+  vp_taint_site_t **vp_taint_active_sites = NULL;
+  u32               vp_taint_active_cnt = 0;
+  vp_taint_site_t  *vp_active_site = NULL;
 
 #ifdef IGNORE_FINDS
 
@@ -5355,10 +5593,32 @@ pacemaker_fuzzing:
 
       }
 
+      if (vp_taint_active_sites) {
+
+        ck_free(vp_taint_active_sites);
+        vp_taint_active_sites = NULL;
+
+      }
+
+      vp_prepare_active_taint_sites(afl, afl->queue_cur, splice_cycle,
+                                    &vp_taint_active_sites,
+                                    &vp_taint_active_cnt);
+
       for (afl->stage_cur = 0; afl->stage_cur < afl->stage_max;
            ++afl->stage_cur) {
 
         u32 use_stacking = 1 << (1 + rand_below(afl, afl->havoc_stack_pow2));
+
+        vp_active_site = NULL;
+        if (vp_taint_active_cnt > 0) {
+
+          vp_active_site =
+              vp_taint_active_sites[afl->stage_cur % vp_taint_active_cnt];
+
+        }
+
+        use_stacking =
+            vp_adjust_use_stacking(afl, use_stacking, vp_active_site);
 
         afl->stage_cur_val = use_stacking;
 
@@ -5415,7 +5675,7 @@ pacemaker_fuzzing:
 
             case 3:
               if (temp_len < 4) { break; }
-              out_buf[rand_below(afl, temp_len)] ^= 0xFF;
+              out_buf[vp_taint_rand_pos(afl, vp_active_site, temp_len)] ^= 0xFF;
               MOpt_globals.cycles_v2[STAGE_FLIP8]++;
 #ifdef INTROSPECTION
               snprintf(afl->m_tmp, sizeof(afl->m_tmp), " FLIP_BIT8");
@@ -5425,7 +5685,8 @@ pacemaker_fuzzing:
 
             case 4:
               if (temp_len < 8) { break; }
-              *(u16 *)(out_buf + rand_below(afl, temp_len - 1)) ^= 0xFFFF;
+              *(u16 *)(out_buf + vp_taint_rand_pos(afl, vp_active_site,
+                                                   temp_len - 1)) ^= 0xFFFF;
               MOpt_globals.cycles_v2[STAGE_FLIP16]++;
 #ifdef INTROSPECTION
               snprintf(afl->m_tmp, sizeof(afl->m_tmp), " FLIP_BIT16");
@@ -5435,7 +5696,8 @@ pacemaker_fuzzing:
 
             case 5:
               if (temp_len < 8) { break; }
-              *(u32 *)(out_buf + rand_below(afl, temp_len - 3)) ^= 0xFFFFFFFF;
+              *(u32 *)(out_buf + vp_taint_rand_pos(afl, vp_active_site,
+                                                   temp_len - 3)) ^= 0xFFFFFFFF;
               MOpt_globals.cycles_v2[STAGE_FLIP32]++;
 #ifdef INTROSPECTION
               snprintf(afl->m_tmp, sizeof(afl->m_tmp), " FLIP_BIT32");
@@ -5444,9 +5706,9 @@ pacemaker_fuzzing:
               break;
 
             case 6:
-              out_buf[rand_below(afl, temp_len)] -=
+              out_buf[vp_taint_rand_pos(afl, vp_active_site, temp_len)] -=
                   1 + rand_below(afl, ARITH_MAX);
-              out_buf[rand_below(afl, temp_len)] +=
+              out_buf[vp_taint_rand_pos(afl, vp_active_site, temp_len)] +=
                   1 + rand_below(afl, ARITH_MAX);
               MOpt_globals.cycles_v2[STAGE_ARITH8]++;
 #ifdef INTROSPECTION
@@ -5460,7 +5722,7 @@ pacemaker_fuzzing:
               if (temp_len < 8) { break; }
               if (rand_below(afl, 2)) {
 
-                u32 pos = rand_below(afl, temp_len - 1);
+                u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 1);
                 *(u16 *)(out_buf + pos) -= 1 + rand_below(afl, ARITH_MAX);
 #ifdef INTROSPECTION
                 snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH16-%u", pos);
@@ -5469,7 +5731,7 @@ pacemaker_fuzzing:
 
               } else {
 
-                u32 pos = rand_below(afl, temp_len - 1);
+                u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 1);
                 u16 num = 1 + rand_below(afl, ARITH_MAX);
 #ifdef INTROSPECTION
                 snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH16BE-%u-%u",
@@ -5484,7 +5746,7 @@ pacemaker_fuzzing:
               /* Randomly add to word, random endian. */
               if (rand_below(afl, 2)) {
 
-                u32 pos = rand_below(afl, temp_len - 1);
+                u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 1);
 #ifdef INTROSPECTION
                 snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH16+-%u", pos);
                 strcat(afl->mutation, afl->m_tmp);
@@ -5493,7 +5755,7 @@ pacemaker_fuzzing:
 
               } else {
 
-                u32 pos = rand_below(afl, temp_len - 1);
+                u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 1);
                 u16 num = 1 + rand_below(afl, ARITH_MAX);
 #ifdef INTROSPECTION
                 snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH16BE+-%u-%u",
@@ -5513,7 +5775,7 @@ pacemaker_fuzzing:
               if (temp_len < 8) { break; }
               if (rand_below(afl, 2)) {
 
-                u32 pos = rand_below(afl, temp_len - 3);
+                u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 3);
 #ifdef INTROSPECTION
                 snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH32_-%u", pos);
                 strcat(afl->mutation, afl->m_tmp);
@@ -5522,7 +5784,7 @@ pacemaker_fuzzing:
 
               } else {
 
-                u32 pos = rand_below(afl, temp_len - 3);
+                u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 3);
                 u32 num = 1 + rand_below(afl, ARITH_MAX);
 #ifdef INTROSPECTION
                 snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH32BE_-%u-%u",
@@ -5538,7 +5800,7 @@ pacemaker_fuzzing:
               // if (temp_len < 4) break;
               if (rand_below(afl, 2)) {
 
-                u32 pos = rand_below(afl, temp_len - 3);
+                u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 3);
 #ifdef INTROSPECTION
                 snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH32+-%u", pos);
                 strcat(afl->mutation, afl->m_tmp);
@@ -5547,7 +5809,7 @@ pacemaker_fuzzing:
 
               } else {
 
-                u32 pos = rand_below(afl, temp_len - 3);
+                u32 pos = vp_taint_rand_pos(afl, vp_active_site, temp_len - 3);
                 u32 num = 1 + rand_below(afl, ARITH_MAX);
 #ifdef INTROSPECTION
                 snprintf(afl->m_tmp, sizeof(afl->m_tmp), " ARITH32BE+-%u-%u",
@@ -5565,7 +5827,7 @@ pacemaker_fuzzing:
             case 9:
               /* Set byte to interesting value. */
               if (temp_len < 4) { break; }
-              out_buf[rand_below(afl, temp_len)] =
+              out_buf[vp_taint_rand_pos(afl, vp_active_site, temp_len)] =
                   interesting_8[rand_below(afl, sizeof(interesting_8))];
               MOpt_globals.cycles_v2[STAGE_INTEREST8]++;
 #ifdef INTROSPECTION
@@ -5583,7 +5845,8 @@ pacemaker_fuzzing:
                 snprintf(afl->m_tmp, sizeof(afl->m_tmp), " INTERESTING16");
                 strcat(afl->mutation, afl->m_tmp);
 #endif
-                *(u16 *)(out_buf + rand_below(afl, temp_len - 1)) =
+                *(u16 *)(out_buf +
+                         vp_taint_rand_pos(afl, vp_active_site, temp_len - 1)) =
                     interesting_16[rand_below(afl,
                                               sizeof(interesting_16) >> 1)];
 
@@ -5593,7 +5856,8 @@ pacemaker_fuzzing:
                 snprintf(afl->m_tmp, sizeof(afl->m_tmp), " INTERESTING16BE");
                 strcat(afl->mutation, afl->m_tmp);
 #endif
-                *(u16 *)(out_buf + rand_below(afl, temp_len - 1)) =
+                *(u16 *)(out_buf +
+                         vp_taint_rand_pos(afl, vp_active_site, temp_len - 1)) =
                     SWAP16(interesting_16[rand_below(
                         afl, sizeof(interesting_16) >> 1)]);
 
@@ -5613,7 +5877,8 @@ pacemaker_fuzzing:
                 snprintf(afl->m_tmp, sizeof(afl->m_tmp), " INTERESTING32");
                 strcat(afl->mutation, afl->m_tmp);
 #endif
-                *(u32 *)(out_buf + rand_below(afl, temp_len - 3)) =
+                *(u32 *)(out_buf +
+                         vp_taint_rand_pos(afl, vp_active_site, temp_len - 3)) =
                     interesting_32[rand_below(afl,
                                               sizeof(interesting_32) >> 2)];
 
@@ -5623,7 +5888,8 @@ pacemaker_fuzzing:
                 snprintf(afl->m_tmp, sizeof(afl->m_tmp), " INTERESTING32BE");
                 strcat(afl->mutation, afl->m_tmp);
 #endif
-                *(u32 *)(out_buf + rand_below(afl, temp_len - 3)) =
+                *(u32 *)(out_buf +
+                         vp_taint_rand_pos(afl, vp_active_site, temp_len - 3)) =
                     SWAP32(interesting_32[rand_below(
                         afl, sizeof(interesting_32) >> 2)]);
 
@@ -5638,7 +5904,8 @@ pacemaker_fuzzing:
                  why not. We use XOR with 1-255 to eliminate the
                  possibility of a no-op. */
 
-              out_buf[rand_below(afl, temp_len)] ^= 1 + rand_below(afl, 255);
+              out_buf[vp_taint_rand_pos(afl, vp_active_site, temp_len)] ^=
+                  1 + rand_below(afl, 255);
               MOpt_globals.cycles_v2[STAGE_RANDOMBYTE]++;
 #ifdef INTROSPECTION
               snprintf(afl->m_tmp, sizeof(afl->m_tmp), " RAND8");
@@ -6337,6 +6604,13 @@ pacemaker_fuzzing:
     }                                                              /* block */
 
   }                                                                /* block */
+
+  if (vp_taint_active_sites) {
+
+    ck_free(vp_taint_active_sites);
+    vp_taint_active_sites = NULL;
+
+  }
 
   ++afl->queue_cur->fuzz_level;
   return ret_val;
