@@ -687,6 +687,8 @@ static inline void vp_maybe_disable_entry(afl_state_t        *afl,
 static inline void vp_dec_ref(afl_state_t *afl, struct queue_entry *q) {
 
   if (!q || !q->vp_ref_cnt) return;
+  q->vp_taint_owner_dirty = 1;
+  if (++q->vp_taint_owner_epoch == 0) { q->vp_taint_owner_epoch = 1; }
   --q->vp_ref_cnt;
   if (!q->vp_ref_cnt) {
 
@@ -708,6 +710,8 @@ static inline void vp_dec_ref(afl_state_t *afl, struct queue_entry *q) {
 static inline void vp_inc_ref(struct queue_entry *q) {
 
   if (!q) return;
+  q->vp_taint_owner_dirty = 1;
+  if (++q->vp_taint_owner_epoch == 0) { q->vp_taint_owner_epoch = 1; }
   ++q->vp_ref_cnt;
 
 }

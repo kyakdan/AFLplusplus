@@ -70,6 +70,8 @@ struct vp_taint_resume {
   u32                    *sensitive_caps;
   u32                   **sensitive_bufs;
   u32                     exec_cnt;
+  u32                     owner_epoch;
+  u64                     owner_sig;
 
 };
 
@@ -91,7 +93,7 @@ typedef struct {
 } vp_taint_file_site_t;
 
 #define VP_TAINT_FILE_MAGIC 0x56505431U                           /* "VPT1" */
-#define VP_TAINT_FILE_VERSION 3U
+#define VP_TAINT_FILE_VERSION 1U
 
 /* ---- helpers ---- */
 
@@ -198,6 +200,16 @@ u8 vp_taint_site_owned(afl_state_t *afl, u16 site_id, struct queue_entry *q) {
 static void collect_owned_sites(afl_state_t *afl, struct queue_entry *q,
                                 u16 **out_sites, u32 *out_cnt) {
 
+  if (!out_sites || !out_cnt) return;
+
+  if (!afl || !q || !afl->vp_frontier || !q->vp_ref_cnt) {
+
+    *out_sites = NULL;
+    *out_cnt = 0;
+    return;
+
+  }
+
   u32    refs_left = q->vp_ref_cnt;
   size_t span = vp_taint_site_span(afl);
 
@@ -242,6 +254,62 @@ static void collect_owned_sites(afl_state_t *afl, struct queue_entry *q,
 
   *out_sites = sites;
   *out_cnt = cnt;
+
+}
+
+/* Hash owned site IDs into a stable, non-zero signature. */
+static u64 vp_taint_owner_signature_from_sites(const u16 *sites, u32 n_sites) {
+
+  const u64 fnv_offset = 1469598103934665603ULL;
+  const u64 fnv_prime = 1099511628211ULL;
+
+  u64 sig = fnv_offset;
+  sig ^= (u64)n_sites;
+  sig *= fnv_prime;
+
+  for (u32 i = 0; i < n_sites; i++) {
+
+    sig ^= (u64)sites[i] + 1U;
+    sig *= fnv_prime;
+
+  }
+
+  return sig ? sig : 1U;
+
+}
+
+/* Build owner signature from the currently owned VP sites. */
+static u64 vp_taint_owner_signature_current(afl_state_t        *afl,
+                                            struct queue_entry *q) {
+
+  if (!afl || !q || !afl->vp_frontier || !q->vp_ref_cnt) return 0;
+
+  u16 *owned_sites = NULL;
+  u32  n_owned = 0;
+  collect_owned_sites(afl, q, &owned_sites, &n_owned);
+
+  if (!n_owned) {
+
+    ck_free(owned_sites);
+    return 0;
+
+  }
+
+  u64 sig = vp_taint_owner_signature_from_sites(owned_sites, n_owned);
+  ck_free(owned_sites);
+  return sig;
+
+}
+
+static void vp_taint_reset_runtime_state(struct queue_entry *q) {
+
+  if (!q) return;
+  vp_taint_resume_free(q);
+  if (q->vp_taint) { vp_taint_free(q); }
+  q->vp_taint_done = 0;
+  q->vp_taint_taint_epoch = 0;
+  q->vp_taint_owner_sig = 0;
+  q->vp_taint_owner_dirty = 0;
 
 }
 
@@ -420,8 +488,9 @@ static u8 *vp_taint_phase1(afl_state_t *afl, u8 *orig_buf, u8 *changed_buf,
     if (vp_taint_exec(afl, work_buf, len, owned_sites, n_owned, &result,
                       saved_sites)) {
 
-      /* Execution wants to bail — mark everything non-neutral, stop. */
-      memset(non_neutral, 1, len);
+      /* Inconclusive execution (timeout/stop/error): keep current range
+         conservative and stop; caller will resume later if possible. */
+      range_insert_sorted(&ranges, start, end);
       goto phase1_done;
 
     }
@@ -466,7 +535,7 @@ static u8 *vp_taint_phase1(afl_state_t *afl, u8 *orig_buf, u8 *changed_buf,
       if (vp_taint_exec(afl, work_buf, len, owned_sites, n_owned, &result,
                         saved_sites)) {
 
-        memset(non_neutral, 1, len);
+        range_insert_sorted(&ranges, start, end);
         goto phase1_done;
 
       }
@@ -758,17 +827,6 @@ static void vp_taint_build_list_from_resume(struct queue_entry *q) {
 
   }
 
-  if (!q->vp_taint) {
-
-    vp_taint_site_t *empty = ck_alloc(sizeof(vp_taint_site_t));
-    empty->site_id = 0;
-    empty->sensitive_cnt = 0;
-    empty->sensitive_positions = NULL;
-    empty->next = NULL;
-    q->vp_taint = empty;
-
-  }
-
 }
 
 static void vp_taint_state_filename(afl_state_t *afl, struct queue_entry *q,
@@ -777,6 +835,15 @@ static void vp_taint_state_filename(afl_state_t *afl, struct queue_entry *q,
   const char *base = strrchr((char *)q->fname, '/');
   base = base ? base + 1 : (char *)q->fname;
   snprintf(buf, buf_len, "%s/queue/.state/vp_taint/%s", afl->out_dir, base);
+
+}
+
+static void vp_taint_delete_state(afl_state_t *afl, struct queue_entry *q) {
+
+  if (!afl || !q || !afl->out_dir || !q->fname) return;
+  char fn[PATH_MAX];
+  vp_taint_state_filename(afl, q, fn, sizeof(fn));
+  unlink(fn);
 
 }
 
@@ -827,7 +894,7 @@ static void vp_taint_free_site_list(vp_taint_site_t *head) {
 
 static void vp_taint_save_state(afl_state_t *afl, struct queue_entry *q) {
 
-  if (!afl || !q || !q->vp_taint) return;
+  if (!afl || !q || !q->vp_taint_done) return;
 
   char fn[PATH_MAX];
   vp_taint_state_filename(afl, q, fn, sizeof(fn));
@@ -871,7 +938,7 @@ static void vp_taint_save_state(afl_state_t *afl, struct queue_entry *q) {
 
 void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
 
-  if (!afl || !q || q->vp_taint || !afl->out_dir) return;
+  if (!afl || !q || q->vp_taint_done || q->vp_taint || !afl->out_dir) return;
   if (afl->value_profile_level != 1) return;
 
   char fn[PATH_MAX];
@@ -894,19 +961,6 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
 
     close(fd);
     unlink(fn);
-    return;
-
-  }
-
-  if (!hdr.site_cnt) {
-
-    vp_taint_site_t *empty = ck_alloc(sizeof(vp_taint_site_t));
-    empty->site_id = 0;
-    empty->sensitive_cnt = 0;
-    empty->sensitive_positions = NULL;
-    empty->next = NULL;
-    q->vp_taint = empty;
-    close(fd);
     return;
 
   }
@@ -979,20 +1033,11 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
 
   }
 
-  if (!loaded) {
-
-    vp_taint_site_t *empty = ck_alloc(sizeof(vp_taint_site_t));
-    empty->site_id = 0;
-    empty->sensitive_cnt = 0;
-    empty->sensitive_positions = NULL;
-    empty->next = NULL;
-    q->vp_taint = empty;
-
-  } else {
-
-    q->vp_taint = loaded;
-
-  }
+  q->vp_taint = loaded;
+  q->vp_taint_done = 1;
+  q->vp_taint_owner_sig = vp_taint_owner_signature_current(afl, q);
+  q->vp_taint_taint_epoch = q->vp_taint_owner_sig ? q->vp_taint_owner_epoch : 0;
+  q->vp_taint_owner_dirty = (u8)!q->vp_taint_owner_sig;
 
 }
 
@@ -1004,7 +1049,72 @@ void vp_taint_analyze(afl_state_t *afl, struct queue_entry *q) {
   if (!q->vp_ref_cnt) return;
   if (!afl->shm.vp_map) return;
   if (q->len < 2) return;
-  if (q->vp_taint) return;
+
+  u64 owner_sig = 0;
+  if (q->vp_taint_resume && q->vp_taint_resume->owner_sig &&
+      q->vp_taint_resume->owner_epoch == q->vp_taint_owner_epoch) {
+
+    owner_sig = q->vp_taint_resume->owner_sig;
+
+  } else if (q->vp_taint_done && q->vp_taint_owner_sig &&
+
+             q->vp_taint_taint_epoch &&
+             q->vp_taint_taint_epoch == q->vp_taint_owner_epoch &&
+             !q->vp_taint_owner_dirty) {
+
+    owner_sig = q->vp_taint_owner_sig;
+
+  } else {
+
+    owner_sig = vp_taint_owner_signature_current(afl, q);
+
+  }
+
+  if (!owner_sig) {
+
+    /* No currently-owned sites: clear stale in-memory state and retry later. */
+    vp_taint_reset_runtime_state(q);
+    return;
+
+  }
+
+  if (q->vp_taint_done && !q->vp_taint_resume) {
+
+    if (!q->vp_taint_owner_sig) {
+
+      /* Unknown provenance (e.g. legacy loaded state). Recompute taint once
+         under current ownership instead of trusting stale persisted data. */
+      vp_taint_reset_runtime_state(q);
+      vp_taint_delete_state(afl, q);
+
+    }
+
+    if (q->vp_taint_owner_sig == owner_sig) {
+
+      /* Ownership stayed stable; existing taint remains valid. */
+      q->vp_taint_owner_dirty = 0;
+      q->vp_taint_taint_epoch = q->vp_taint_owner_epoch;
+      return;
+
+    }
+
+  }
+
+  if ((q->vp_taint_done && q->vp_taint_owner_sig &&
+       q->vp_taint_owner_sig != owner_sig) ||
+      (q->vp_taint_resume && q->vp_taint_resume->owner_sig != owner_sig)) {
+
+    vp_taint_reset_runtime_state(q);
+    vp_taint_delete_state(afl, q);
+
+  }
+
+  if (!q->vp_taint_done && q->vp_taint && !q->vp_taint_resume) {
+
+    vp_taint_free(q);
+    vp_taint_delete_state(afl, q);
+
+  }
 
   u64 start_ms = get_cur_time();
   u8 *orig_buf = queue_testcase_get(afl, q);
@@ -1015,9 +1125,16 @@ void vp_taint_analyze(afl_state_t *afl, struct queue_entry *q) {
     /* First run for this entry: collect baseline and build phase-2 plan. */
     vp_taint_resume_t *st = ck_alloc(sizeof(vp_taint_resume_t));
     q->vp_taint_resume = st;
+    st->owner_epoch = q->vp_taint_owner_epoch;
+    st->owner_sig = owner_sig;
 
     collect_owned_sites(afl, q, &st->owned_sites, &st->n_owned);
-    if (!st->n_owned) goto finalize_resume;
+    if (!st->n_owned) {
+
+      vp_taint_resume_free(q);
+      return;
+
+    }
 
     vp_site_t *saved_sites = ck_alloc(st->n_owned * sizeof(vp_site_t));
     vp_taint_exec_result_t baseline_result;
@@ -1122,21 +1239,16 @@ void vp_taint_analyze(afl_state_t *afl, struct queue_entry *q) {
 finalize_resume:
   if (q->vp_taint_resume) {
 
+    q->vp_taint_owner_sig = q->vp_taint_resume->owner_sig;
     vp_taint_build_list_from_resume(q);
     vp_taint_resume_free(q);
 
   }
 
-  if (!q->vp_taint) {
-
-    vp_taint_site_t *empty = ck_alloc(sizeof(vp_taint_site_t));
-    empty->site_id = 0;
-    empty->sensitive_cnt = 0;
-    empty->sensitive_positions = NULL;
-    empty->next = NULL;
-    q->vp_taint = empty;
-
-  }
+  q->vp_taint_done = 1;
+  q->vp_taint_taint_epoch = q->vp_taint_owner_epoch;
+  if (!q->vp_taint_owner_sig) q->vp_taint_owner_sig = owner_sig;
+  q->vp_taint_owner_dirty = 0;
 
   vp_taint_save_state(afl, q);
 
@@ -1175,6 +1287,22 @@ u32 vp_taint_rand_pos(afl_state_t *afl, vp_taint_site_t *site, u32 max_pos) {
 
 void vp_taint_free(struct queue_entry *q) {
 
+  if (!q || !q->vp_taint) {
+
+    if (q) {
+
+      q->vp_taint = NULL;
+      q->vp_taint_done = 0;
+      q->vp_taint_taint_epoch = 0;
+      q->vp_taint_owner_sig = 0;
+      q->vp_taint_owner_dirty = 0;
+
+    }
+
+    return;
+
+  }
+
   vp_taint_site_t *node = q->vp_taint;
   while (node) {
 
@@ -1186,6 +1314,10 @@ void vp_taint_free(struct queue_entry *q) {
   }
 
   q->vp_taint = NULL;
+  q->vp_taint_done = 0;
+  q->vp_taint_taint_epoch = 0;
+  q->vp_taint_owner_sig = 0;
+  q->vp_taint_owner_dirty = 0;
 
 }
 

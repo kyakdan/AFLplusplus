@@ -326,8 +326,13 @@ struct queue_entry {
 
   /* VP taint analysis */
   u32                   vp_taint_round; /* havoc rounds since last VP find  */
+  u8                    vp_taint_done;  /* taint analysis completed?        */
+  u8                    vp_taint_owner_dirty; /* owner set changed?         */
+  u32                   vp_taint_owner_epoch; /* bumps on owner churn       */
+  u32                   vp_taint_taint_epoch; /* owner epoch at taint build */
   struct vp_taint_site *vp_taint;       /* per-site taint masks (list)      */
   vp_taint_resume_t    *vp_taint_resume;
+  u64                   vp_taint_owner_sig; /* owned-site signature at taint */
 
 };
 

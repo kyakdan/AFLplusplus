@@ -418,16 +418,28 @@ static void vp_prepare_active_taint_sites(afl_state_t        *afl,
   *out_sites = NULL;
   *out_cnt = 0;
 
+  u8 taint_first_needed =
+      (u8)(!q->vp_taint_done && !q->vp_taint_resume && !q->vp_taint);
+  u8 taint_refresh_needed =
+      (u8)(q->vp_taint_resume ||
+           (q->vp_taint_done &&
+            (q->vp_taint_owner_dirty || !q->vp_taint_owner_sig)) ||
+           (!q->vp_taint_done && q->vp_taint));
+
   u32 vp_taint_threshold = VP_TAINT_STAGNATION_THRESHOLD;
   if (!splice_cycle && afl->value_profile_level == 1 && q->vp_ref_cnt > 0 &&
-      !q->vp_taint &&
-      (!vp_taint_threshold || q->vp_taint_round >= vp_taint_threshold)) {
+      (taint_refresh_needed ||
+       (taint_first_needed &&
+        (!vp_taint_threshold || q->vp_taint_round >= vp_taint_threshold)))) {
 
     vp_taint_analyze(afl, q);
 
   }
 
-  if (!q->vp_taint) return;
+  u8 taint_ready =
+      (u8)(q->vp_taint_done && q->vp_taint && !q->vp_taint_resume &&
+           !q->vp_taint_owner_dirty && q->vp_taint_owner_sig);
+  if (!taint_ready) return;
 
   for (vp_taint_site_t *node = q->vp_taint; node; node = node->next) {
 
@@ -447,7 +459,10 @@ static void vp_prepare_active_taint_sites(afl_state_t        *afl,
 static u32 vp_build_sensitive_bitmap(afl_state_t *afl, struct queue_entry *q,
                                      u32 len, u8 *map) {
 
-  if (!afl || !q || !q->vp_taint || !q->vp_ref_cnt || !len || !map) return 0;
+  if (!afl || !q || !q->vp_taint_done || !q->vp_taint || !q->vp_ref_cnt ||
+      q->vp_taint_resume || q->vp_taint_owner_dirty || !q->vp_taint_owner_sig ||
+      !len || !map)
+    return 0;
 
   u32 sensitive_cnt = 0;
   for (vp_taint_site_t *node = q->vp_taint; node; node = node->next) {
@@ -836,7 +851,10 @@ u8 fuzz_one_original(afl_state_t *afl) {
 
   if (afl->value_profile_level == 1 && afl->queue_cur->favored &&
       afl->queue_cur->vp_only && afl->queue_cur->vp_ref_cnt > 0 &&
-      afl->queue_cur->vp_taint) {
+      afl->queue_cur->vp_taint_done && afl->queue_cur->vp_taint &&
+      !afl->queue_cur->vp_taint_resume &&
+      !afl->queue_cur->vp_taint_owner_dirty &&
+      afl->queue_cur->vp_taint_owner_sig) {
 
     size_t skip_map_size = ((size_t)len + 7U) / 8U;
     if (skip_map_size) {

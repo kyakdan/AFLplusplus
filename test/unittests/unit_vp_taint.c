@@ -3,6 +3,7 @@
 #include <setjmp.h>
 #include <assert.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <cmocka.h>
@@ -1025,6 +1026,7 @@ static void test_vp_taint_state_save_and_load(void **state) {
   fname = alloc_printf("%s/queue/id:000001", tmp_dir);
   q_save.fname = fname;
   q_save.len = VP_TAINT_TEST_LEN;
+  q_save.vp_taint_done = 1;
 
   vp_taint_site_t *n = ck_alloc(sizeof(vp_taint_site_t));
   n->site_id = 7;
@@ -1042,6 +1044,7 @@ static void test_vp_taint_state_save_and_load(void **state) {
   vp_taint_load_state(&afl, &q_load);
 
   assert_non_null(q_load.vp_taint);
+  assert_int_equal(q_load.vp_taint_done, 1);
   assert_int_equal(q_load.vp_taint->site_id, 7);
   assert_int_equal(q_load.vp_taint->sensitive_cnt, 2);
   assert_int_equal(q_load.vp_taint->sensitive_positions[0], 3);
@@ -1052,6 +1055,358 @@ static void test_vp_taint_state_save_and_load(void **state) {
   ck_free(fname);
 
   snprintf(state_file, sizeof(state_file), "%s/queue/.state/vp_taint/id:000001",
+           tmp_dir);
+  unlink(state_file);
+
+  {
+
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/queue/.state/vp_taint", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue/.state/deterministic_done", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue/.state", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue", tmp_dir);
+    rmdir(p);
+    rmdir(tmp_dir);
+
+  }
+
+}
+
+static void test_vp_taint_state_load_rejects_truncated_file(void **state) {
+
+  (void)state;
+
+  afl_state_t        afl;
+  struct queue_entry q;
+  char               tmp_tpl[] = "/tmp/afl-vp-taint-corrupt-XXXXXX";
+  char              *tmp_dir = mkdtemp(tmp_tpl);
+  char               state_file[PATH_MAX];
+  u8                *fname = NULL;
+
+  assert_non_null(tmp_dir);
+  vp_taint_mk_state_dirs(tmp_dir);
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q, 0, sizeof(q));
+
+  afl.out_dir = (u8 *)tmp_dir;
+  afl.perm = 0600;
+  afl.value_profile_level = 1;
+
+  fname = alloc_printf("%s/queue/id:000003", tmp_dir);
+  q.fname = fname;
+  q.len = VP_TAINT_TEST_LEN;
+
+  snprintf(state_file, sizeof(state_file), "%s/queue/.state/vp_taint/id:000003",
+           tmp_dir);
+
+  {
+
+    FILE *fp = fopen(state_file, "wb");
+    assert_non_null(fp);
+
+    vp_taint_file_header_t hdr = {.magic = VP_TAINT_FILE_MAGIC,
+                                  .version = VP_TAINT_FILE_VERSION,
+                                  .len = VP_TAINT_TEST_LEN,
+                                  .site_cnt = 1};
+    vp_taint_file_site_t site = {.site_id = 0, .reserved = 0, .sensitive_cnt = 2};
+    u32                  only_one_pos = 7;
+
+    assert_int_equal(fwrite(&hdr, sizeof(hdr), 1, fp), 1);
+    assert_int_equal(fwrite(&site, sizeof(site), 1, fp), 1);
+    assert_int_equal(fwrite(&only_one_pos, sizeof(only_one_pos), 1, fp), 1);
+    fclose(fp);
+
+  }
+
+  vp_taint_load_state(&afl, &q);
+  assert_null(q.vp_taint);
+  assert_int_equal(q.vp_taint_done, 0);
+  assert_int_equal(access(state_file, F_OK), -1);
+
+  ck_free(fname);
+
+  {
+
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/queue/.state/vp_taint", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue/.state/deterministic_done", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue/.state", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue", tmp_dir);
+    rmdir(p);
+    rmdir(tmp_dir);
+
+  }
+
+}
+
+static void test_vp_taint_state_save_and_load_empty_result(void **state) {
+
+  (void)state;
+
+  afl_state_t        afl;
+  struct queue_entry q_save, q_load;
+  char               tmp_tpl[] = "/tmp/afl-vp-taint-empty-XXXXXX";
+  char              *tmp_dir = mkdtemp(tmp_tpl);
+  char               state_file[PATH_MAX];
+  u8                *fname = NULL;
+
+  assert_non_null(tmp_dir);
+  vp_taint_mk_state_dirs(tmp_dir);
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q_save, 0, sizeof(q_save));
+  memset(&q_load, 0, sizeof(q_load));
+
+  afl.out_dir = (u8 *)tmp_dir;
+  afl.perm = 0600;
+  afl.value_profile_level = 1;
+
+  fname = alloc_printf("%s/queue/id:000005", tmp_dir);
+  q_save.fname = fname;
+  q_save.len = VP_TAINT_TEST_LEN;
+  q_save.vp_taint_done = 1;
+
+  vp_taint_save_state(&afl, &q_save);
+
+  q_load.fname = fname;
+  q_load.len = VP_TAINT_TEST_LEN;
+  vp_taint_load_state(&afl, &q_load);
+
+  assert_null(q_load.vp_taint);
+  assert_int_equal(q_load.vp_taint_done, 1);
+
+  ck_free(fname);
+
+  snprintf(state_file, sizeof(state_file), "%s/queue/.state/vp_taint/id:000005",
+           tmp_dir);
+  unlink(state_file);
+
+  {
+
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/queue/.state/vp_taint", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue/.state/deterministic_done", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue/.state", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue", tmp_dir);
+    rmdir(p);
+    rmdir(tmp_dir);
+
+  }
+
+}
+
+static void test_vp_taint_reanalyzes_when_owned_sites_change(void **state) {
+
+  (void)state;
+
+  afl_state_t        afl;
+  struct queue_entry q;
+  u8                 vp_sensitive[VP_TAINT_TEST_LEN];
+  size_t             frontier_n;
+  size_t             span;
+  u64                sig_before;
+  char               tmp_tpl[] = "/tmp/afl-vp-taint-drift-XXXXXX";
+  char              *tmp_dir = mkdtemp(tmp_tpl);
+  u8                *fname = NULL;
+  char               state_file[PATH_MAX];
+
+  assert_non_null(tmp_dir);
+  vp_taint_mk_state_dirs(tmp_dir);
+
+  vp_taint_model_reset();
+  vp_taint_model_set_path_range(0, 0, 0, 4, VP_TAINT_PATH_BYTE);
+  vp_taint_model_set_vp_range_eq(0, 0, 0, 0x1111, 8, 4, VP_TAINT_VP_BYTE);
+  vp_taint_model_set_path_range(1, 1, 16, 4, VP_TAINT_PATH_BYTE);
+  vp_taint_model_set_vp_range_eq(1, 1, 0, 0x2222, 24, 4, VP_TAINT_VP_BYTE_2);
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q, 0, sizeof(q));
+
+  afl.value_profile_active = 1;
+  afl.value_profile_level = 1;
+  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
+  afl.value_profile_slots = 1;
+  afl.fixed_seed = 1;
+  afl.rand_seed[0] = 1;
+  afl.rand_seed[1] = 2;
+  afl.rand_seed[2] = 3;
+  afl.out_dir = (u8 *)tmp_dir;
+  afl.perm = 0600;
+
+  afl.shm.vp_map = ck_alloc(sizeof(vp_map_t));
+  assert_non_null(afl.shm.vp_map);
+
+  frontier_n = (size_t)CMP_MAP_W * afl.value_profile_slots *
+               VP_RUNTIME_SLOT_REPLICA_LIMIT;
+  afl.vp_frontier = ck_alloc(frontier_n * sizeof(vp_frontier_entry_t));
+  assert_non_null(afl.vp_frontier);
+  for (size_t i = 0; i < frontier_n; ++i) {
+
+    afl.vp_frontier[i].dist = VP_DIST_UNSOLVED;
+
+  }
+
+  fname = alloc_printf("%s/queue/id:000004", tmp_dir);
+  q.fname = fname;
+  q.id = 4;
+  q.len = VP_TAINT_TEST_LEN;
+
+  span = vp_taint_frontier_span(afl.value_profile_slots);
+  afl.vp_frontier[0 * span + 0].owner = &q;
+  afl.vp_frontier[0 * span + 0].dist = 5;
+  q.vp_ref_cnt = 1;
+
+  vp_taint_fake_time_ms = 0;
+  vp_taint_fake_time_step = 1;
+  vp_taint_analyze(&afl, &q);
+  assert_int_equal(q.vp_taint_done, 1);
+  assert_non_null(q.vp_taint);
+  sig_before = q.vp_taint_owner_sig;
+
+  vp_taint_bitmap_from_list(&q, vp_sensitive, VP_TAINT_TEST_LEN);
+  for (u32 i = 8; i < 12; ++i)
+    assert_int_equal(vp_sensitive[i], 1);
+  for (u32 i = 24; i < 28; ++i)
+    assert_int_equal(vp_sensitive[i], 0);
+
+  afl.vp_frontier[0 * span + 0].owner = NULL;
+  afl.vp_frontier[0 * span + 0].dist = VP_DIST_UNSOLVED;
+  afl.vp_frontier[1 * span + 0].owner = &q;
+  afl.vp_frontier[1 * span + 0].dist = 5;
+  q.vp_ref_cnt = 1;
+
+  vp_taint_analyze(&afl, &q);
+  assert_int_equal(q.vp_taint_done, 1);
+  assert_int_not_equal(q.vp_taint_owner_sig, sig_before);
+
+  vp_taint_bitmap_from_list(&q, vp_sensitive, VP_TAINT_TEST_LEN);
+  for (u32 i = 8; i < 12; ++i)
+    assert_int_equal(vp_sensitive[i], 0);
+  for (u32 i = 24; i < 28; ++i)
+    assert_int_equal(vp_sensitive[i], 1);
+
+  if (q.vp_taint) vp_taint_free(&q);
+  vp_taint_resume_free(&q);
+  ck_free(fname);
+  ck_free(afl.vp_frontier);
+  ck_free(afl.shm.vp_map);
+
+  snprintf(state_file, sizeof(state_file), "%s/queue/.state/vp_taint/id:000004",
+           tmp_dir);
+  unlink(state_file);
+
+  {
+
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/queue/.state/vp_taint", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue/.state/deterministic_done", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue/.state", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue", tmp_dir);
+    rmdir(p);
+    rmdir(tmp_dir);
+
+  }
+
+}
+
+static void test_vp_taint_clears_dirty_when_owned_sites_unchanged(void **state) {
+
+  (void)state;
+
+  afl_state_t        afl;
+  struct queue_entry q;
+  size_t             frontier_n;
+  size_t             span;
+  u64                sig_before;
+  char               tmp_tpl[] = "/tmp/afl-vp-taint-stable-XXXXXX";
+  char              *tmp_dir = mkdtemp(tmp_tpl);
+  u8                *fname = NULL;
+  char               state_file[PATH_MAX];
+
+  assert_non_null(tmp_dir);
+  vp_taint_mk_state_dirs(tmp_dir);
+
+  vp_taint_model_reset();
+  vp_taint_model_set_path_range(0, 0, 0, 8, VP_TAINT_PATH_BYTE);
+  vp_taint_model_set_vp_range_eq(0, 0, 0, 0x1234, 8, 8, VP_TAINT_VP_BYTE);
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q, 0, sizeof(q));
+
+  afl.value_profile_active = 1;
+  afl.value_profile_level = 1;
+  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
+  afl.value_profile_slots = 1;
+  afl.fixed_seed = 1;
+  afl.rand_seed[0] = 1;
+  afl.rand_seed[1] = 2;
+  afl.rand_seed[2] = 3;
+  afl.out_dir = (u8 *)tmp_dir;
+  afl.perm = 0600;
+
+  afl.shm.vp_map = ck_alloc(sizeof(vp_map_t));
+  assert_non_null(afl.shm.vp_map);
+
+  frontier_n = (size_t)CMP_MAP_W * afl.value_profile_slots *
+               VP_RUNTIME_SLOT_REPLICA_LIMIT;
+  afl.vp_frontier = ck_alloc(frontier_n * sizeof(vp_frontier_entry_t));
+  assert_non_null(afl.vp_frontier);
+  for (size_t i = 0; i < frontier_n; ++i) {
+
+    afl.vp_frontier[i].dist = VP_DIST_UNSOLVED;
+
+  }
+
+  fname = alloc_printf("%s/queue/id:000006", tmp_dir);
+  q.fname = fname;
+  q.id = 6;
+  q.len = VP_TAINT_TEST_LEN;
+
+  span = vp_taint_frontier_span(afl.value_profile_slots);
+  afl.vp_frontier[0 * span + 0].owner = &q;
+  afl.vp_frontier[0 * span + 0].dist = 5;
+  q.vp_ref_cnt = 1;
+
+  vp_taint_fake_time_ms = 0;
+  vp_taint_fake_time_step = 1;
+  vp_taint_analyze(&afl, &q);
+
+  assert_int_equal(q.vp_taint_done, 1);
+  assert_non_null(q.vp_taint);
+  assert_int_equal(q.vp_taint_owner_dirty, 0);
+  assert_true(q.vp_taint_owner_sig != 0);
+  sig_before = q.vp_taint_owner_sig;
+
+  /* Simulate owner churn that resolves back to the same owned-site set. */
+  q.vp_taint_owner_dirty = 1;
+  vp_taint_analyze(&afl, &q);
+
+  assert_int_equal(q.vp_taint_done, 1);
+  assert_non_null(q.vp_taint);
+  assert_null(q.vp_taint_resume);
+  assert_int_equal(q.vp_taint_owner_dirty, 0);
+  assert_int_equal(q.vp_taint_owner_sig, sig_before);
+
+  if (q.vp_taint) vp_taint_free(&q);
+  vp_taint_resume_free(&q);
+  ck_free(fname);
+  ck_free(afl.vp_frontier);
+  ck_free(afl.shm.vp_map);
+
+  snprintf(state_file, sizeof(state_file), "%s/queue/.state/vp_taint/id:000006",
            tmp_dir);
   unlink(state_file);
 
@@ -1189,6 +1544,10 @@ int main(int argc, char **argv) {
       cmocka_unit_test(test_vp_taint_metric1_only_changes_are_sensitive),
       cmocka_unit_test(test_vp_taint_sub8_interleaving_relaxed_invariants),
       cmocka_unit_test(test_vp_taint_state_save_and_load),
+      cmocka_unit_test(test_vp_taint_state_load_rejects_truncated_file),
+      cmocka_unit_test(test_vp_taint_state_save_and_load_empty_result),
+      cmocka_unit_test(test_vp_taint_reanalyzes_when_owned_sites_change),
+      cmocka_unit_test(test_vp_taint_clears_dirty_when_owned_sites_unchanged),
       cmocka_unit_test(test_vp_taint_analyze_resumes_after_timeout)};
 
   __real_exit(cmocka_run_group_tests(tests, NULL, NULL));
