@@ -2563,12 +2563,12 @@ havoc_stage:
 
     u32 use_stacking = 1 + rand_below(afl, stack_max);
 
-    /* VP taint: pick active site via round-robin from precomputed list. */
+    /* VP taint: pick active site uniformly at random. */
     vp_active_site = NULL;
     if (vp_taint_active_cnt > 0) {
 
       vp_active_site =
-          vp_taint_active_sites[afl->stage_cur % vp_taint_active_cnt];
+          vp_taint_active_sites[rand_below(afl, vp_taint_active_cnt)];
 
     }
 
@@ -5699,7 +5699,7 @@ pacemaker_fuzzing:
         if (vp_taint_active_cnt > 0) {
 
           vp_active_site =
-              vp_taint_active_sites[afl->stage_cur % vp_taint_active_cnt];
+              vp_taint_active_sites[rand_below(afl, vp_taint_active_cnt)];
 
         }
 
