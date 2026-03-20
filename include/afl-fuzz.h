@@ -327,12 +327,11 @@ struct queue_entry {
   /* VP taint analysis */
   u32                   vp_taint_round; /* havoc rounds since last VP find  */
   u8                    vp_taint_done;  /* taint analysis completed?        */
-  u8                    vp_taint_owner_dirty; /* owner set changed?         */
-  u32                   vp_taint_owner_epoch; /* bumps on owner churn       */
-  u32                   vp_taint_taint_epoch; /* owner epoch at taint build */
+  u8                    vp_taint_needs_refresh;  /* ownership drift hint     */
+  u16                   vp_taint_refresh_streak; /* persistent mismatch cnt  */
+  u16                   vp_taint_refresh_cooldown; /* refresh backoff visits */
   struct vp_taint_site *vp_taint;       /* per-site taint masks (list)      */
   vp_taint_resume_t    *vp_taint_resume;
-  u64                   vp_taint_owner_sig; /* owned-site signature at taint */
 
 };
 
@@ -1432,6 +1431,7 @@ void vp_prepare_exec(afl_state_t *, afl_forkserver_t *);
 
 void vp_taint_analyze(afl_state_t *, struct queue_entry *);
 u8   vp_taint_site_owned(afl_state_t *, u16, struct queue_entry *);
+u8   vp_taint_has_missing_owned_sites(afl_state_t *, struct queue_entry *);
 u32  vp_taint_rand_pos(afl_state_t *, vp_taint_site_t *, u32);
 void vp_taint_free(struct queue_entry *);
 void vp_taint_resume_free(struct queue_entry *);

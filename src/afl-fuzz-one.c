@@ -30,6 +30,9 @@
 #include "cmplog.h"
 #include "afl-mutations.h"
 
+#define VP_TAINT_REFRESH_MISMATCH_ROUNDS 3U
+#define VP_TAINT_REFRESH_COOLDOWN_ROUNDS 8U
+
 /* MOpt */
 
 static int select_algorithm(afl_state_t *afl, u32 max_algorithm) {
@@ -409,38 +412,87 @@ static inline u32 vp_adjust_use_stacking(afl_state_t *afl, u32 base_use,
 
 }
 
-static void vp_prepare_active_taint_sites(afl_state_t        *afl,
-                                          struct queue_entry *q,
-                                          u8                  splice_cycle,
-                                          vp_taint_site_t  ***out_sites,
-                                          u32                *out_cnt) {
+static inline u8 vp_taint_ready(const struct queue_entry *q) {
 
-  *out_sites = NULL;
-  *out_cnt = 0;
+  return (u8)(q && q->vp_taint_done && !q->vp_taint_resume);
+
+}
+
+static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
+                                   u8 splice_cycle, u8 force_first) {
+
+  if (!afl || !q || splice_cycle || afl->value_profile_level != 1 ||
+      !q->vp_ref_cnt)
+    return;
+
+  if (!force_first && q->vp_taint_refresh_cooldown)
+    q->vp_taint_refresh_cooldown--;
 
   u8 taint_first_needed =
       (u8)(!q->vp_taint_done && !q->vp_taint_resume && !q->vp_taint);
-  u8 taint_refresh_needed =
-      (u8)(q->vp_taint_resume ||
-           (q->vp_taint_done &&
-            (q->vp_taint_owner_dirty || !q->vp_taint_owner_sig)) ||
-           (!q->vp_taint_done && q->vp_taint));
+  u8 taint_refresh_triggered = 0;
+
+  if (!force_first && vp_taint_ready(q) && q->vp_taint &&
+      q->vp_taint_needs_refresh && !q->vp_taint_resume) {
+
+    if (vp_taint_has_missing_owned_sites(afl, q)) {
+
+      if (q->vp_taint_refresh_streak < (u16)~0) q->vp_taint_refresh_streak++;
+      if (!q->vp_taint_refresh_cooldown &&
+          q->vp_taint_refresh_streak >= VP_TAINT_REFRESH_MISMATCH_ROUNDS) {
+
+        /* Rebuild taint for persistent ownership drift. Existing taint is
+           cleared by vp_taint_analyze() when vp_taint_done is false. */
+        q->vp_taint_done = 0;
+        taint_refresh_triggered = 1;
+
+      }
+
+    } else {
+
+      q->vp_taint_needs_refresh = 0;
+      q->vp_taint_refresh_streak = 0;
+
+    }
+
+  }
+
+  u8 taint_repair_needed =
+      (u8)(q->vp_taint_resume || (!q->vp_taint_done && q->vp_taint));
 
   u32 vp_taint_threshold = VP_TAINT_STAGNATION_THRESHOLD;
-  if (!splice_cycle && afl->value_profile_level == 1 && q->vp_ref_cnt > 0 &&
-      (taint_refresh_needed ||
-       (taint_first_needed &&
-        (!vp_taint_threshold || q->vp_taint_round >= vp_taint_threshold)))) {
+  if (taint_repair_needed ||
+      (taint_first_needed && (force_first || !vp_taint_threshold ||
+                              q->vp_taint_round >= vp_taint_threshold))) {
 
     vp_taint_analyze(afl, q);
 
   }
 
-  u8 taint_ready =
-      (u8)(q->vp_taint_done && q->vp_taint && !q->vp_taint_resume &&
-           !q->vp_taint_owner_dirty && q->vp_taint_owner_sig);
-  if (!taint_ready) return;
+  if (taint_refresh_triggered && vp_taint_ready(q)) {
 
+    q->vp_taint_needs_refresh = 0;
+    q->vp_taint_refresh_streak = 0;
+    q->vp_taint_refresh_cooldown = VP_TAINT_REFRESH_COOLDOWN_ROUNDS;
+
+  }
+
+}
+
+static void vp_prepare_active_taint_sites(afl_state_t        *afl,
+                                          struct queue_entry *q,
+                                          u8 splice_cycle, u8 force_first,
+                                          vp_taint_site_t ***out_sites,
+                                          u32               *out_cnt) {
+
+  *out_sites = NULL;
+  *out_cnt = 0;
+
+  vp_maybe_analyze_taint(afl, q, splice_cycle, force_first);
+
+  if (!vp_taint_ready(q) || !q->vp_taint) return;
+
+  u8 have_owned = 0;
   for (vp_taint_site_t *node = q->vp_taint; node; node = node->next) {
 
     if (node->sensitive_cnt > 0 && vp_taint_site_owned(afl, node->site_id, q)) {
@@ -449,8 +501,21 @@ static void vp_prepare_active_taint_sites(afl_state_t        *afl,
           ck_realloc(*out_sites, (*out_cnt + 1U) * sizeof(vp_taint_site_t *));
       *out_sites = tmp;
       (*out_sites)[(*out_cnt)++] = node;
+      have_owned = 1;
 
     }
+
+  }
+
+  if (have_owned) return;
+
+  for (vp_taint_site_t *node = q->vp_taint; node; node = node->next) {
+
+    if (!node->sensitive_cnt) continue;
+    vp_taint_site_t **tmp =
+        ck_realloc(*out_sites, (*out_cnt + 1U) * sizeof(vp_taint_site_t *));
+    *out_sites = tmp;
+    (*out_sites)[(*out_cnt)++] = node;
 
   }
 
@@ -459,15 +524,15 @@ static void vp_prepare_active_taint_sites(afl_state_t        *afl,
 static u32 vp_build_sensitive_bitmap(afl_state_t *afl, struct queue_entry *q,
                                      u32 len, u8 *map) {
 
-  if (!afl || !q || !q->vp_taint_done || !q->vp_taint || !q->vp_ref_cnt ||
-      q->vp_taint_resume || q->vp_taint_owner_dirty || !q->vp_taint_owner_sig ||
-      !len || !map)
+  if (!afl || !q || !vp_taint_ready(q) || !q->vp_taint || !len || !map)
     return 0;
 
   u32 sensitive_cnt = 0;
+  u8  have_owned = 0;
   for (vp_taint_site_t *node = q->vp_taint; node; node = node->next) {
 
     if (!vp_taint_site_owned(afl, node->site_id, q)) continue;
+    have_owned = 1;
 
     for (u32 i = 0; i < node->sensitive_cnt; i++) {
 
@@ -480,21 +545,16 @@ static u32 vp_build_sensitive_bitmap(afl_state_t *afl, struct queue_entry *q,
 
   }
 
-  /* Taint is computed once per entry while ownership can change over time.
-     If no currently-owned site contributes bytes, fall back to all stored
-     taint for this entry. */
-  if (!sensitive_cnt) {
+  if (have_owned) return sensitive_cnt;
 
-    for (vp_taint_site_t *node = q->vp_taint; node; node = node->next) {
+  for (vp_taint_site_t *node = q->vp_taint; node; node = node->next) {
 
-      for (u32 i = 0; i < node->sensitive_cnt; i++) {
+    for (u32 i = 0; i < node->sensitive_cnt; i++) {
 
-        u32 pos = node->sensitive_positions[i];
-        if (pos >= len || bitmap_read(map, pos)) continue;
-        bitmap_set(map, pos);
-        sensitive_cnt++;
-
-      }
+      u32 pos = node->sensitive_positions[i];
+      if (pos >= len || bitmap_read(map, pos)) continue;
+      bitmap_set(map, pos);
+      sensitive_cnt++;
 
     }
 
@@ -848,13 +908,20 @@ u8 fuzz_one_original(afl_state_t *afl) {
 #endif
   u8 *skip_eff_map = afl->queue_cur->skipdet_e->skip_eff_map;
   u8  vp_det_use_vp_map = 0;
+  u8  vp_det_candidate =
+      (u8)(afl->value_profile_level == 1 && afl->queue_cur->favored &&
+           afl->queue_cur->vp_only && afl->queue_cur->vp_ref_cnt > 0);
 
-  if (afl->value_profile_level == 1 && afl->queue_cur->favored &&
-      afl->queue_cur->vp_only && afl->queue_cur->vp_ref_cnt > 0 &&
-      afl->queue_cur->vp_taint_done && afl->queue_cur->vp_taint &&
-      !afl->queue_cur->vp_taint_resume &&
-      !afl->queue_cur->vp_taint_owner_dirty &&
-      afl->queue_cur->vp_taint_owner_sig) {
+  if (vp_det_candidate) {
+
+    /* For VP-only favored entries, prepare taint before deterministic gating
+       so the first visit can use VP-guided deterministic mutations. */
+    vp_maybe_analyze_taint(afl, afl->queue_cur, 0, 1);
+
+  }
+
+  if (vp_det_candidate && vp_taint_ready(afl->queue_cur) &&
+      afl->queue_cur->vp_taint) {
 
     size_t skip_map_size = ((size_t)len + 7U) / 8U;
     if (skip_map_size) {
@@ -880,7 +947,7 @@ u8 fuzz_one_original(afl_state_t *afl) {
 
   }
 
-  if (!afl->skip_deterministic && !vp_det_use_vp_map) {
+  if (!afl->skip_deterministic && !vp_det_use_vp_map && !vp_det_candidate) {
 
     if (!skip_deterministic_stage(afl, in_buf, out_buf, len, before_det_time)) {
 
@@ -900,6 +967,7 @@ u8 fuzz_one_original(afl_state_t *afl) {
      deterministic stage. */
 
   if (likely(afl->skip_deterministic) || likely(afl->queue_cur->passed_det) ||
+      likely(vp_det_candidate && !vp_det_use_vp_map) ||
       likely(!vp_det_use_vp_map &&
              !afl->queue_cur->skipdet_e->quick_eff_bytes) ||
       likely(perf_score <
@@ -2403,7 +2471,7 @@ havoc_stage:
   vp_taint_site_t *vp_active_site = NULL;
   u32              vp_saved_before = afl->queued_items;
 
-  vp_prepare_active_taint_sites(afl, afl->queue_cur, splice_cycle,
+  vp_prepare_active_taint_sites(afl, afl->queue_cur, splice_cycle, 0,
                                 &vp_taint_active_sites, &vp_taint_active_cnt);
 
   /* We essentially just do several thousand runs (depending on perf_score)
@@ -5618,7 +5686,7 @@ pacemaker_fuzzing:
 
       }
 
-      vp_prepare_active_taint_sites(afl, afl->queue_cur, splice_cycle,
+      vp_prepare_active_taint_sites(afl, afl->queue_cur, splice_cycle, 0,
                                     &vp_taint_active_sites,
                                     &vp_taint_active_cnt);
 
@@ -6886,4 +6954,3 @@ u8 fuzz_one(afl_state_t *afl) {
   return (key_val_lv_1 | key_val_lv_2);
 
 }
-

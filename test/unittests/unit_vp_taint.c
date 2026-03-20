@@ -1205,7 +1205,8 @@ static void test_vp_taint_state_save_and_load_empty_result(void **state) {
 
 }
 
-static void test_vp_taint_reanalyzes_when_owned_sites_change(void **state) {
+static void test_vp_taint_keeps_initial_result_when_owned_sites_change(
+    void **state) {
 
   (void)state;
 
@@ -1214,7 +1215,6 @@ static void test_vp_taint_reanalyzes_when_owned_sites_change(void **state) {
   u8                 vp_sensitive[VP_TAINT_TEST_LEN];
   size_t             frontier_n;
   size_t             span;
-  u64                sig_before;
   char               tmp_tpl[] = "/tmp/afl-vp-taint-drift-XXXXXX";
   char              *tmp_dir = mkdtemp(tmp_tpl);
   u8                *fname = NULL;
@@ -1271,7 +1271,7 @@ static void test_vp_taint_reanalyzes_when_owned_sites_change(void **state) {
   vp_taint_analyze(&afl, &q);
   assert_int_equal(q.vp_taint_done, 1);
   assert_non_null(q.vp_taint);
-  sig_before = q.vp_taint_owner_sig;
+  assert_int_equal(vp_taint_has_missing_owned_sites(&afl, &q), 0);
 
   vp_taint_bitmap_from_list(&q, vp_sensitive, VP_TAINT_TEST_LEN);
   for (u32 i = 8; i < 12; ++i)
@@ -1284,16 +1284,18 @@ static void test_vp_taint_reanalyzes_when_owned_sites_change(void **state) {
   afl.vp_frontier[1 * span + 0].owner = &q;
   afl.vp_frontier[1 * span + 0].dist = 5;
   q.vp_ref_cnt = 1;
+  assert_int_equal(vp_taint_has_missing_owned_sites(&afl, &q), 1);
 
   vp_taint_analyze(&afl, &q);
   assert_int_equal(q.vp_taint_done, 1);
-  assert_int_not_equal(q.vp_taint_owner_sig, sig_before);
+  assert_non_null(q.vp_taint);
+  assert_null(q.vp_taint_resume);
 
   vp_taint_bitmap_from_list(&q, vp_sensitive, VP_TAINT_TEST_LEN);
   for (u32 i = 8; i < 12; ++i)
-    assert_int_equal(vp_sensitive[i], 0);
-  for (u32 i = 24; i < 28; ++i)
     assert_int_equal(vp_sensitive[i], 1);
+  for (u32 i = 24; i < 28; ++i)
+    assert_int_equal(vp_sensitive[i], 0);
 
   if (q.vp_taint) vp_taint_free(&q);
   vp_taint_resume_free(&q);
@@ -1322,7 +1324,7 @@ static void test_vp_taint_reanalyzes_when_owned_sites_change(void **state) {
 
 }
 
-static void test_vp_taint_clears_dirty_when_owned_sites_unchanged(void **state) {
+static void test_vp_taint_second_call_is_noop_after_completion(void **state) {
 
   (void)state;
 
@@ -1330,7 +1332,6 @@ static void test_vp_taint_clears_dirty_when_owned_sites_unchanged(void **state) 
   struct queue_entry q;
   size_t             frontier_n;
   size_t             span;
-  u64                sig_before;
   char               tmp_tpl[] = "/tmp/afl-vp-taint-stable-XXXXXX";
   char              *tmp_dir = mkdtemp(tmp_tpl);
   u8                *fname = NULL;
@@ -1386,19 +1387,15 @@ static void test_vp_taint_clears_dirty_when_owned_sites_unchanged(void **state) 
 
   assert_int_equal(q.vp_taint_done, 1);
   assert_non_null(q.vp_taint);
-  assert_int_equal(q.vp_taint_owner_dirty, 0);
-  assert_true(q.vp_taint_owner_sig != 0);
-  sig_before = q.vp_taint_owner_sig;
+  assert_null(q.vp_taint_resume);
+  vp_taint_site_t *first_list = q.vp_taint;
 
-  /* Simulate owner churn that resolves back to the same owned-site set. */
-  q.vp_taint_owner_dirty = 1;
+  /* Completed analysis should be reused as-is on subsequent calls. */
   vp_taint_analyze(&afl, &q);
 
   assert_int_equal(q.vp_taint_done, 1);
-  assert_non_null(q.vp_taint);
+  assert_ptr_equal(q.vp_taint, first_list);
   assert_null(q.vp_taint_resume);
-  assert_int_equal(q.vp_taint_owner_dirty, 0);
-  assert_int_equal(q.vp_taint_owner_sig, sig_before);
 
   if (q.vp_taint) vp_taint_free(&q);
   vp_taint_resume_free(&q);
@@ -1546,8 +1543,8 @@ int main(int argc, char **argv) {
       cmocka_unit_test(test_vp_taint_state_save_and_load),
       cmocka_unit_test(test_vp_taint_state_load_rejects_truncated_file),
       cmocka_unit_test(test_vp_taint_state_save_and_load_empty_result),
-      cmocka_unit_test(test_vp_taint_reanalyzes_when_owned_sites_change),
-      cmocka_unit_test(test_vp_taint_clears_dirty_when_owned_sites_unchanged),
+      cmocka_unit_test(test_vp_taint_keeps_initial_result_when_owned_sites_change),
+      cmocka_unit_test(test_vp_taint_second_call_is_noop_after_completion),
       cmocka_unit_test(test_vp_taint_analyze_resumes_after_timeout)};
 
   __real_exit(cmocka_run_group_tests(tests, NULL, NULL));
