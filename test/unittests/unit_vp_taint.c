@@ -1324,6 +1324,48 @@ static void test_vp_taint_keeps_initial_result_when_owned_sites_change(
 
 }
 
+static void test_vp_taint_missing_owned_detects_empty_taint(void **state) {
+
+  (void)state;
+
+  afl_state_t        afl;
+  struct queue_entry q;
+  size_t             frontier_n;
+  size_t             span;
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q, 0, sizeof(q));
+
+  afl.value_profile_active = 1;
+  afl.value_profile_level = 1;
+  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
+  afl.value_profile_slots = 1;
+
+  frontier_n = (size_t)CMP_MAP_W * afl.value_profile_slots *
+               VP_RUNTIME_SLOT_REPLICA_LIMIT;
+  afl.vp_frontier = ck_alloc(frontier_n * sizeof(vp_frontier_entry_t));
+  assert_non_null(afl.vp_frontier);
+  for (size_t i = 0; i < frontier_n; ++i) {
+
+    afl.vp_frontier[i].dist = VP_DIST_UNSOLVED;
+
+  }
+
+  q.id = 123;
+  q.vp_ref_cnt = 1;
+  q.vp_taint_done = 1;
+  q.vp_taint = NULL;
+
+  span = vp_taint_frontier_span(afl.value_profile_slots);
+  afl.vp_frontier[0 * span + 0].owner = &q;
+  afl.vp_frontier[0 * span + 0].dist = 5;
+
+  assert_int_equal(vp_taint_has_missing_owned_sites(&afl, &q), 1);
+
+  ck_free(afl.vp_frontier);
+
+}
+
 static void test_vp_taint_second_call_is_noop_after_completion(void **state) {
 
   (void)state;
@@ -1544,6 +1586,7 @@ int main(int argc, char **argv) {
       cmocka_unit_test(test_vp_taint_state_load_rejects_truncated_file),
       cmocka_unit_test(test_vp_taint_state_save_and_load_empty_result),
       cmocka_unit_test(test_vp_taint_keeps_initial_result_when_owned_sites_change),
+      cmocka_unit_test(test_vp_taint_missing_owned_detects_empty_taint),
       cmocka_unit_test(test_vp_taint_second_call_is_noop_after_completion),
       cmocka_unit_test(test_vp_taint_analyze_resumes_after_timeout)};
 

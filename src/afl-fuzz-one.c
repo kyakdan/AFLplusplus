@@ -425,15 +425,11 @@ static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
       !q->vp_ref_cnt)
     return;
 
-  if (!force_first && q->vp_taint_refresh_cooldown)
-    q->vp_taint_refresh_cooldown--;
+  if (q->vp_taint_refresh_cooldown) q->vp_taint_refresh_cooldown--;
 
-  u8 taint_first_needed =
-      (u8)(!q->vp_taint_done && !q->vp_taint_resume && !q->vp_taint);
   u8 taint_refresh_triggered = 0;
 
-  if (!force_first && vp_taint_ready(q) && q->vp_taint &&
-      q->vp_taint_needs_refresh && !q->vp_taint_resume) {
+  if (vp_taint_ready(q) && q->vp_taint_needs_refresh && !q->vp_taint_resume) {
 
     if (vp_taint_has_missing_owned_sites(afl, q)) {
 
@@ -457,8 +453,11 @@ static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
 
   }
 
+  u8 taint_first_needed =
+      (u8)(!q->vp_taint_done && !q->vp_taint_resume && !q->vp_taint);
   u8 taint_repair_needed =
-      (u8)(q->vp_taint_resume || (!q->vp_taint_done && q->vp_taint));
+      (u8)(q->vp_taint_resume || (!q->vp_taint_done && q->vp_taint) ||
+           taint_refresh_triggered);
 
   u32 vp_taint_threshold = VP_TAINT_STAGNATION_THRESHOLD;
   if (taint_repair_needed ||
@@ -487,6 +486,8 @@ static void vp_prepare_active_taint_sites(afl_state_t        *afl,
 
   *out_sites = NULL;
   *out_cnt = 0;
+
+  if (!q || !q->vp_ref_cnt) return;
 
   vp_maybe_analyze_taint(afl, q, splice_cycle, force_first);
 
@@ -524,7 +525,8 @@ static void vp_prepare_active_taint_sites(afl_state_t        *afl,
 static u32 vp_build_sensitive_bitmap(afl_state_t *afl, struct queue_entry *q,
                                      u32 len, u8 *map) {
 
-  if (!afl || !q || !vp_taint_ready(q) || !q->vp_taint || !len || !map)
+  if (!afl || !q || !q->vp_ref_cnt || !vp_taint_ready(q) || !q->vp_taint ||
+      !len || !map)
     return 0;
 
   u32 sensitive_cnt = 0;

@@ -198,7 +198,7 @@ u8 vp_taint_site_owned(afl_state_t *afl, u16 site_id, struct queue_entry *q) {
 
 u8 vp_taint_has_missing_owned_sites(afl_state_t *afl, struct queue_entry *q) {
 
-  if (!afl || !q || !q->vp_ref_cnt || !q->vp_taint_done || !q->vp_taint)
+  if (!afl || !q || !q->vp_ref_cnt || !q->vp_taint_done)
     return 0;
 
   u16 *owned_sites = NULL;
@@ -208,6 +208,13 @@ u8 vp_taint_has_missing_owned_sites(afl_state_t *afl, struct queue_entry *q) {
 
     ck_free(owned_sites);
     return 0;
+
+  }
+
+  if (!q->vp_taint) {
+
+    ck_free(owned_sites);
+    return 1;
 
   }
 
@@ -259,8 +266,9 @@ static void collect_owned_sites(afl_state_t *afl, struct queue_entry *q,
   u32    refs_left = q->vp_ref_cnt;
   size_t span = vp_taint_site_span(afl);
 
-  /* Pre-allocate for worst case: one site per ref. */
-  u16 *sites = ck_alloc(refs_left * sizeof(u16));
+  /* Pre-allocate up to max possible unique sites. */
+  u32 prealloc = MIN(refs_left, (u32)CMP_MAP_W);
+  u16 *sites = ck_alloc(prealloc * sizeof(u16));
   u32  cnt = 0;
 
   for (u32 site = 0; site < CMP_MAP_W && refs_left; site++) {
@@ -1250,4 +1258,3 @@ void vp_taint_free(struct queue_entry *q) {
   q->vp_taint_refresh_cooldown = 0;
 
 }
-
