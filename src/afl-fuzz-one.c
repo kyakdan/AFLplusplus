@@ -2469,6 +2469,13 @@ havoc_stage:
   /* VP taint: prepare active sites for this entry before havoc. */
   vp_taint_site_t *vp_active_site = NULL;
 
+  if (vp_taint_active_sites) {
+
+    ck_free(vp_taint_active_sites);
+    vp_taint_active_sites = NULL;
+
+  }
+
   vp_prepare_active_taint_sites(afl, afl->queue_cur, splice_cycle,
                                 &vp_taint_active_sites, &vp_taint_active_cnt);
 
