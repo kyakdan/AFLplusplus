@@ -325,7 +325,6 @@ struct queue_entry {
   fs_meta_t *fs_meta;                   /* Frameshift metadata              */
 
   /* VP taint analysis */
-  u32                   vp_taint_round; /* havoc rounds since last VP find  */
   u8                    vp_taint_done;  /* taint analysis completed?        */
   u8                    vp_taint_needs_refresh;  /* ownership drift hint     */
   u16                   vp_taint_refresh_streak; /* persistent mismatch cnt  */
@@ -905,7 +904,6 @@ typedef struct afl_state {
 #define VP_RUNTIME_SLOT_FAVOR_LIMIT 1U
 #define VP_TAINT_MIN_RANGE 8U
 #define VP_TAINT_BIAS 80U             /* % chance to pick VP-sensitive byte */
-#define VP_TAINT_STAGNATION_THRESHOLD 0U         /* XXX: temp 0 for testing */
 #define AFL_VP_TAINT_TIMEOUT_MS (10 * 60 * 1000U)
 #define VP_SOURCE_NONE 0U
 #define VP_SOURCE_RUNTIME_SHM 1U
@@ -1710,4 +1708,3 @@ static inline u8 bitmap_read(u8 *map, u32 index) {
 #endif
 
 #endif
-

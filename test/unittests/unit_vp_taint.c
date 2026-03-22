@@ -824,6 +824,229 @@ static void test_vp_taint_phase1_budget_zero_is_conservative(void **state) {
 
 }
 
+static void test_vp_taint_phase1_inconclusive_exec_is_conservative(void **state) {
+
+  (void)state;
+
+  afl_state_t        afl;
+  struct queue_entry q;
+  const vp_taint_owner_ref_t owners[] = {{.site_id = 0, .rel = 0}};
+  u16               *owned_sites = NULL;
+  u32                n_owned = 0;
+  vp_site_t         *saved_sites = NULL;
+  vp_taint_exec_result_t baseline;
+  u8                *changed_buf = NULL;
+  u8                *changed_alt = NULL;
+  u8                *non_neutral = NULL;
+  u32                exec_cnt = 0;
+  u64                start_ms;
+  size_t             frontier_n;
+
+  vp_taint_model_reset();
+  vp_taint_model_set_path_range(0, 0, 0, 8, VP_TAINT_PATH_BYTE);
+  vp_taint_model_set_vp_range_eq(0, 0, 0, 0x1234, 8, 8, VP_TAINT_VP_BYTE);
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q, 0, sizeof(q));
+
+  afl.value_profile_active = 1;
+  afl.value_profile_level = 1;
+  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
+  afl.value_profile_slots = 1;
+  afl.fixed_seed = 1;
+  afl.rand_seed[0] = 1;
+  afl.rand_seed[1] = 2;
+  afl.rand_seed[2] = 3;
+
+  afl.shm.vp_map = ck_alloc(sizeof(vp_map_t));
+  assert_non_null(afl.shm.vp_map);
+
+  frontier_n = (size_t)CMP_MAP_W * afl.value_profile_slots *
+               VP_RUNTIME_SLOT_REPLICA_LIMIT;
+  afl.vp_frontier = ck_alloc(frontier_n * sizeof(vp_frontier_entry_t));
+  assert_non_null(afl.vp_frontier);
+  for (size_t i = 0; i < frontier_n; ++i) {
+
+    afl.vp_frontier[i].dist = VP_DIST_UNSOLVED;
+
+  }
+
+  q.id = 1;
+  q.fname = (u8 *)"vp-taint-unit";
+  q.len = VP_TAINT_TEST_LEN;
+  vp_taint_frontier_set_owners(&afl, &q, owners, ARRAY_SIZE(owners));
+
+  collect_owned_sites(&afl, &q, &owned_sites, &n_owned);
+  assert_non_null(owned_sites);
+  assert_int_equal(n_owned, 1);
+
+  saved_sites = ck_alloc(n_owned * sizeof(vp_site_t));
+  assert_non_null(saved_sites);
+  baseline.sites = ck_alloc(n_owned * sizeof(vp_taint_site_status_t));
+  assert_non_null(baseline.sites);
+
+  assert_int_equal(vp_taint_exec(&afl, vp_taint_test_input, VP_TAINT_TEST_LEN,
+                                 owned_sites, n_owned, &baseline, saved_sites),
+                   0);
+
+  changed_buf = ck_alloc(VP_TAINT_TEST_LEN);
+  changed_alt = ck_alloc(VP_TAINT_TEST_LEN);
+  memcpy(changed_buf, vp_taint_test_input, VP_TAINT_TEST_LEN);
+  memcpy(changed_alt, vp_taint_test_input, VP_TAINT_TEST_LEN);
+  random_replace_vp(&afl, changed_buf, VP_TAINT_TEST_LEN);
+  for (u32 i = 0; i < VP_TAINT_TEST_LEN; ++i) {
+
+    changed_alt[i] ^= 0xFF;
+    if (changed_alt[i] == vp_taint_test_input[i]) changed_alt[i] ^= 0xA5;
+
+  }
+
+  vp_taint_fake_time_ms = 0;
+  vp_taint_fake_time_step = 1;
+  start_ms = get_cur_time();
+
+  vp_taint_force_run_error = 1;
+  non_neutral = vp_taint_phase1(
+      &afl, vp_taint_test_input, changed_buf, changed_alt, VP_TAINT_TEST_LEN,
+      owned_sites, baseline.sites, n_owned, saved_sites, &exec_cnt, start_ms);
+
+  assert_non_null(non_neutral);
+  assert_int_equal(exec_cnt, 0);
+  for (u32 i = 0; i < VP_TAINT_TEST_LEN; ++i)
+    assert_int_equal(non_neutral[i], 1);
+
+  ck_free(non_neutral);
+  ck_free(changed_alt);
+  ck_free(changed_buf);
+  ck_free(baseline.sites);
+  ck_free(saved_sites);
+  ck_free(owned_sites);
+  ck_free(afl.vp_frontier);
+  ck_free(afl.shm.vp_map);
+
+}
+
+static void test_vp_taint_phase2_inconclusive_exec_advances_progress(
+    void **state) {
+
+  (void)state;
+
+  afl_state_t        afl;
+  struct queue_entry q;
+  const vp_taint_owner_ref_t owners[] = {{.site_id = 0, .rel = 0}};
+  u16               *owned_sites = NULL;
+  u32                n_owned = 0;
+  vp_site_t         *saved_sites = NULL;
+  vp_taint_exec_result_t baseline;
+  u8                *non_neutral = NULL;
+  u32               *sensitive_cnts = NULL;
+  u32               *sensitive_caps = NULL;
+  u32              **sensitive_bufs = NULL;
+  u32               *phase2_order = NULL;
+  u32                phase2_cnt = 0;
+  u32                phase2_next_idx = 0;
+  u32                exec_cnt = 0;
+  u64                start_ms;
+  size_t             frontier_n;
+
+  vp_taint_model_reset();
+  vp_taint_model_set_path_range(0, 0, 0, 8, VP_TAINT_PATH_BYTE);
+  vp_taint_model_set_vp_range_eq(0, 0, 0, 0x1234, 8, 8, VP_TAINT_VP_BYTE);
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q, 0, sizeof(q));
+
+  afl.value_profile_active = 1;
+  afl.value_profile_level = 1;
+  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
+  afl.value_profile_slots = 1;
+  afl.fixed_seed = 1;
+  afl.rand_seed[0] = 1;
+  afl.rand_seed[1] = 2;
+  afl.rand_seed[2] = 3;
+
+  afl.shm.vp_map = ck_alloc(sizeof(vp_map_t));
+  assert_non_null(afl.shm.vp_map);
+
+  frontier_n = (size_t)CMP_MAP_W * afl.value_profile_slots *
+               VP_RUNTIME_SLOT_REPLICA_LIMIT;
+  afl.vp_frontier = ck_alloc(frontier_n * sizeof(vp_frontier_entry_t));
+  assert_non_null(afl.vp_frontier);
+  for (size_t i = 0; i < frontier_n; ++i) {
+
+    afl.vp_frontier[i].dist = VP_DIST_UNSOLVED;
+
+  }
+
+  q.id = 1;
+  q.fname = (u8 *)"vp-taint-unit";
+  q.len = VP_TAINT_TEST_LEN;
+  vp_taint_frontier_set_owners(&afl, &q, owners, ARRAY_SIZE(owners));
+
+  collect_owned_sites(&afl, &q, &owned_sites, &n_owned);
+  assert_non_null(owned_sites);
+  assert_int_equal(n_owned, 1);
+
+  saved_sites = ck_alloc(n_owned * sizeof(vp_site_t));
+  assert_non_null(saved_sites);
+  baseline.sites = ck_alloc(n_owned * sizeof(vp_taint_site_status_t));
+  assert_non_null(baseline.sites);
+
+  assert_int_equal(vp_taint_exec(&afl, vp_taint_test_input, VP_TAINT_TEST_LEN,
+                                 owned_sites, n_owned, &baseline, saved_sites),
+                   0);
+
+  non_neutral = ck_alloc(VP_TAINT_TEST_LEN);
+  memset(non_neutral, 0, VP_TAINT_TEST_LEN);
+  non_neutral[VP_TAINT_VP_BEG] = 1;
+
+  phase2_cnt = 1;
+  phase2_order = ck_alloc(sizeof(u32));
+  phase2_order[0] = VP_TAINT_VP_BEG;
+
+  sensitive_cnts = ck_alloc(n_owned * sizeof(u32));
+  sensitive_caps = ck_alloc(n_owned * sizeof(u32));
+  sensitive_bufs = ck_alloc(n_owned * sizeof(u32 *));
+
+  vp_taint_fake_time_ms = 0;
+  vp_taint_fake_time_step = 1;
+  start_ms = get_cur_time();
+
+  vp_taint_force_run_error = 1;
+  vp_taint_phase2(&afl, vp_taint_test_input, VP_TAINT_TEST_LEN, non_neutral,
+                  owned_sites, baseline.sites, n_owned, saved_sites,
+                  sensitive_cnts, sensitive_caps, sensitive_bufs, phase2_order,
+                  phase2_cnt, &phase2_next_idx, &exec_cnt, start_ms);
+
+  assert_int_equal(phase2_next_idx, 1);
+  assert_int_equal(sensitive_cnts[0], 1);
+  assert_non_null(sensitive_bufs[0]);
+  assert_int_equal(sensitive_bufs[0][0], VP_TAINT_VP_BEG);
+
+  vp_taint_force_run_error = 1;
+  start_ms = get_cur_time();
+  vp_taint_phase2(&afl, vp_taint_test_input, VP_TAINT_TEST_LEN, non_neutral,
+                  owned_sites, baseline.sites, n_owned, saved_sites,
+                  sensitive_cnts, sensitive_caps, sensitive_bufs, phase2_order,
+                  phase2_cnt, &phase2_next_idx, &exec_cnt, start_ms);
+
+  assert_int_equal(phase2_next_idx, 1);
+  assert_int_equal(sensitive_cnts[0], 1);
+
+  ck_free(sensitive_bufs[0]);
+  ck_free(sensitive_bufs);
+  ck_free(sensitive_caps);
+  ck_free(sensitive_cnts);
+  ck_free(phase2_order);
+  ck_free(non_neutral);
+  ck_free(baseline.sites);
+  ck_free(saved_sites);
+  ck_free(owned_sites);
+  ck_free(afl.vp_frontier);
+  ck_free(afl.shm.vp_map);
+
+}
+
 static void test_vp_taint_exec_restores_state_on_error_and_stopsoon(
     void **state) {
 
@@ -1578,6 +1801,8 @@ int main(int argc, char **argv) {
       cmocka_unit_test(test_vp_taint_multi_site_ownership),
       cmocka_unit_test(test_vp_taint_asymmetric_perturbation_finds_vp_byte),
       cmocka_unit_test(test_vp_taint_phase1_budget_zero_is_conservative),
+      cmocka_unit_test(test_vp_taint_phase1_inconclusive_exec_is_conservative),
+      cmocka_unit_test(test_vp_taint_phase2_inconclusive_exec_advances_progress),
       cmocka_unit_test(test_vp_taint_exec_restores_state_on_error_and_stopsoon),
       cmocka_unit_test(test_vp_taint_multi_slot_state_changes),
       cmocka_unit_test(test_vp_taint_metric1_only_changes_are_sensitive),

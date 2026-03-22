@@ -487,9 +487,9 @@ static u8 *vp_taint_phase1(afl_state_t *afl, u8 *orig_buf, u8 *changed_buf,
                       saved_sites)) {
 
       /* Inconclusive execution (timeout/stop/error): keep current range
-         conservative and stop; caller will resume later if possible. */
+         conservative and stop; remaining ranges are marked non-neutral. */
       range_insert_sorted(&ranges, start, end);
-      goto phase1_done;
+      break;
 
     }
 
@@ -534,7 +534,7 @@ static u8 *vp_taint_phase1(afl_state_t *afl, u8 *orig_buf, u8 *changed_buf,
                         saved_sites)) {
 
         range_insert_sorted(&ranges, start, end);
-        goto phase1_done;
+        break;
 
       }
 
@@ -592,7 +592,6 @@ static u8 *vp_taint_phase1(afl_state_t *afl, u8 *orig_buf, u8 *changed_buf,
 
   }
 
-phase1_done:
   range_free_all(ranges);
   ck_free(work_buf);
   ck_free(result.sites);
@@ -672,8 +671,35 @@ static void vp_taint_phase2(afl_state_t *afl, u8 *orig_buf, u32 len,
                         saved_sites)) {
 
         work_buf[b] = orig_val;
-        *phase2_next_idx = idx;
-        goto phase2_done;
+        if (afl->stop_soon) {
+
+          *phase2_next_idx = idx;
+          goto phase2_done;
+
+        }
+
+        /* Inconclusive exec for this perturbation (run error/timeout):
+           conservatively keep progress by marking unresolved sites sensitive
+           for this byte and move to the next byte. */
+        for (u32 i = 0; i < n_owned; i++) {
+
+          if (site_resolved[i]) continue;
+          if (sensitive_cnts[i] >= sensitive_caps[i]) {
+
+            u32 new_cap = sensitive_caps[i] ? sensitive_caps[i] * 2 : 32;
+            sensitive_bufs[i] =
+                ck_realloc(sensitive_bufs[i], new_cap * sizeof(u32));
+            sensitive_caps[i] = new_cap;
+
+          }
+
+          u32 insert_idx = sensitive_cnts[i]++;
+          sensitive_bufs[i][insert_idx] = b;
+          site_resolved[i] = 1;
+
+        }
+
+        break;
 
       }
 

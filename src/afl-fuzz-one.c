@@ -419,7 +419,7 @@ static inline u8 vp_taint_ready(const struct queue_entry *q) {
 }
 
 static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
-                                   u8 splice_cycle, u8 force_first) {
+                                   u8 splice_cycle) {
 
   if (!afl || !q || splice_cycle || afl->value_profile_level != 1 ||
       !q->vp_ref_cnt)
@@ -459,10 +459,7 @@ static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
       (u8)(q->vp_taint_resume || (!q->vp_taint_done && q->vp_taint) ||
            taint_refresh_triggered);
 
-  u32 vp_taint_threshold = VP_TAINT_STAGNATION_THRESHOLD;
-  if (taint_repair_needed ||
-      (taint_first_needed && (force_first || !vp_taint_threshold ||
-                              q->vp_taint_round >= vp_taint_threshold))) {
+  if (taint_repair_needed || taint_first_needed) {
 
     vp_taint_analyze(afl, q);
 
@@ -480,7 +477,7 @@ static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
 
 static void vp_prepare_active_taint_sites(afl_state_t        *afl,
                                           struct queue_entry *q,
-                                          u8 splice_cycle, u8 force_first,
+                                          u8 splice_cycle,
                                           vp_taint_site_t ***out_sites,
                                           u32               *out_cnt) {
 
@@ -489,7 +486,7 @@ static void vp_prepare_active_taint_sites(afl_state_t        *afl,
 
   if (!q || !q->vp_ref_cnt) return;
 
-  vp_maybe_analyze_taint(afl, q, splice_cycle, force_first);
+  vp_maybe_analyze_taint(afl, q, splice_cycle);
 
   if (!vp_taint_ready(q) || !q->vp_taint) return;
 
@@ -918,7 +915,7 @@ u8 fuzz_one_original(afl_state_t *afl) {
 
     /* For VP-only favored entries, prepare taint before deterministic gating
        so the first visit can use VP-guided deterministic mutations. */
-    vp_maybe_analyze_taint(afl, afl->queue_cur, 0, 1);
+    vp_maybe_analyze_taint(afl, afl->queue_cur, 0);
 
   }
 
@@ -932,7 +929,7 @@ u8 fuzz_one_original(afl_state_t *afl) {
       u32 sensitive_cnt = vp_build_sensitive_bitmap(afl, afl->queue_cur, len,
                                                     vp_det_skip_eff_map);
 
-      /* Broad taint falls back to regular skipdet analysis. */
+      /* Broad taint disables VP-guided deterministic selection for this visit. */
       if (sensitive_cnt && (u64)sensitive_cnt * 4U < (u64)len * 3U) {
 
         vp_det_use_vp_map = 1;
@@ -2469,11 +2466,10 @@ havoc_stage:
 
   }
 
-  /* VP taint: trigger analysis if this entry has stagnated. */
+  /* VP taint: prepare active sites for this entry before havoc. */
   vp_taint_site_t *vp_active_site = NULL;
-  u32              vp_saved_before = afl->queued_items;
 
-  vp_prepare_active_taint_sites(afl, afl->queue_cur, splice_cycle, 0,
+  vp_prepare_active_taint_sites(afl, afl->queue_cur, splice_cycle,
                                 &vp_taint_active_sites, &vp_taint_active_cnt);
 
   /* We essentially just do several thousand runs (depending on perf_score)
@@ -3852,22 +3848,6 @@ havoc_stage:
   }
 
   new_hit_cnt = afl->queued_items + afl->saved_crashes;
-
-  /* VP taint: track stagnation for this havoc visit. */
-  if (!splice_cycle && afl->value_profile_level == 1 &&
-      afl->queue_cur->vp_ref_cnt > 0) {
-
-    if (afl->queued_items == vp_saved_before) {
-
-      afl->queue_cur->vp_taint_round++;
-
-    } else {
-
-      afl->queue_cur->vp_taint_round = 0;
-
-    }
-
-  }
 
   if (!splice_cycle) {
 
@@ -5688,7 +5668,7 @@ pacemaker_fuzzing:
 
       }
 
-      vp_prepare_active_taint_sites(afl, afl->queue_cur, splice_cycle, 0,
+      vp_prepare_active_taint_sites(afl, afl->queue_cur, splice_cycle,
                                     &vp_taint_active_sites,
                                     &vp_taint_active_cnt);
 
