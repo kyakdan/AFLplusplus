@@ -253,6 +253,12 @@ void load_stats_file(afl_state_t *afl) {
 
       }
 
+      if (starts_with("vp_start_time", keystring)) {
+
+        afl->vp_start_time = 1000 * strtoull(lptr, &nptr, 10);
+
+      }
+
       if (starts_with("trim_time", keystring)) {
 
         afl->trim_time_us = strtoull(lptr, &nptr, 10) * 1000000;
@@ -528,6 +534,8 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
 
     fprintf(f, "value_profile_finds  : %llu\n",
             (unsigned long long)afl->value_profile_finds);
+    fprintf(f, "vp_start_time        : %llu\n",
+            (unsigned long long)(afl->vp_start_time / 1000));
 
   }
 

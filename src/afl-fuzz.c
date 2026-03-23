@@ -3482,6 +3482,12 @@ int main(int argc, char **argv_orig, char **envp) {
   if (unlikely(afl->old_seed_selection)) seek_to = find_start_position(afl);
 
   afl->start_time = get_cur_time();
+  if (afl->value_profile_mode == 1) {
+
+    vp_note_activation(afl, afl->start_time);
+
+  }
+
   if (afl->in_place_resume || afl->afl_env.afl_autoresume) {
 
     load_stats_file(afl);

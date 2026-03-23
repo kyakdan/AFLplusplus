@@ -894,6 +894,7 @@ typedef struct afl_state {
   u32 value_profile_stagnation_secs;   /* Stagnation threshold (seconds)    */
   u8  value_profile_active;            /* Currently active?                 */
   u64 value_profile_finds;             /* Inputs saved via value profiling  */
+  u64 vp_start_time;                   /* Time VP first became active (ms)  */
   u64 value_profile_enabled_cycle;     /* queue_cycle when VP was enabled   */
   u32 value_profile_replay_idx;        /* Next queue index to replay when   */
                                      /* stagnation mode re-activates VP   */
@@ -1410,6 +1411,7 @@ void afl_dump_module_map(afl_state_t *);
 
 /* Value profiling (afl-fuzz-valprof.c) */
 
+void vp_note_activation(afl_state_t *, u64);
 void vp_update_activation(afl_state_t *);
 void vp_frontier_apply(afl_state_t *, struct queue_entry *);
 void vp_frontier_apply_with_cost(afl_state_t *, struct queue_entry *, u64);

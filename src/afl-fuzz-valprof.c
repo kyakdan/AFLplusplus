@@ -1893,6 +1893,13 @@ static void vp_replay_queue(afl_state_t *afl) {
 
 /* Check stagnation and activate/deactivate value profiling. */
 
+void vp_note_activation(afl_state_t *afl, u64 now) {
+
+  if (!afl || !afl->value_profile_mode || afl->vp_start_time) return;
+  afl->vp_start_time = now ? now : get_cur_time();
+
+}
+
 void vp_update_activation(afl_state_t *afl) {
 
   if (afl->value_profile_mode != 2) return;
@@ -1908,6 +1915,7 @@ void vp_update_activation(afl_state_t *afl) {
   if (should && !afl->value_profile_active) {
 
     afl->value_profile_active = 1;
+    vp_note_activation(afl, cur);
     afl->value_profile_enabled_cycle = afl->queue_cycle;
     vp_replay_queue(afl);
     afl->score_changed = 1;
