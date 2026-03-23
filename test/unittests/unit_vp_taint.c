@@ -460,7 +460,9 @@ static size_t vp_taint_frontier_span(u32 slots) {
 
 static void vp_taint_rebuild_owned_sites(afl_state_t *afl, struct queue_entry *q) {
 
-  ck_free(q->vp_owned_sites);
+  u16 *old_sites = q->vp_owned_sites;
+  u32  old_cnt = q->vp_owned_site_cnt;
+
   q->vp_owned_sites = NULL;
   q->vp_owned_site_cnt = 0;
   q->vp_owned_site_cap = 0;
@@ -487,6 +489,16 @@ static void vp_taint_rebuild_owned_sites(afl_state_t *afl, struct queue_entry *q
     q->vp_owned_site_cap = q->vp_owned_site_cnt;
 
   }
+
+  u8 changed = old_cnt != q->vp_owned_site_cnt;
+  if (!changed && old_cnt) {
+
+    changed = (u8)memcmp(old_sites, q->vp_owned_sites, old_cnt * sizeof(u16));
+
+  }
+
+  ck_free(old_sites);
+  if (changed) { vp_taint_note_owned_sites_changed(q); }
 
 }
 
@@ -1661,7 +1673,8 @@ static void test_vp_taint_keeps_initial_result_when_owned_sites_change(
   vp_taint_analyze(&afl, &q);
   assert_int_equal(q.vp_taint_done, 1);
   assert_non_null(q.vp_taint);
-  assert_int_equal(vp_taint_has_missing_owned_sites(&afl, &q), 0);
+  assert_int_equal(vp_taint_covers_owned_sites(&q), 1);
+  assert_int_equal(q.vp_taint_generation, q.vp_owned_sites_generation);
 
   vp_taint_bitmap_from_list(&q, vp_sensitive, VP_TAINT_TEST_LEN);
   for (u32 i = 8; i < 12; ++i)
@@ -1674,7 +1687,8 @@ static void test_vp_taint_keeps_initial_result_when_owned_sites_change(
   afl.vp_frontier[1 * span + 0].owner = &q;
   afl.vp_frontier[1 * span + 0].dist = 5;
   vp_taint_rebuild_owned_sites(&afl, &q);
-  assert_int_equal(vp_taint_has_missing_owned_sites(&afl, &q), 1);
+  assert_int_equal(vp_taint_covers_owned_sites(&q), 0);
+  assert_true(q.vp_taint_generation != q.vp_owned_sites_generation);
 
   vp_taint_analyze(&afl, &q);
   assert_int_equal(q.vp_taint_done, 1);
@@ -1714,7 +1728,8 @@ static void test_vp_taint_keeps_initial_result_when_owned_sites_change(
 
 }
 
-static void test_vp_taint_missing_owned_detects_empty_taint(void **state) {
+static void test_vp_taint_unanalyzed_empty_result_does_not_cover_owned(
+    void **state) {
 
   (void)state;
 
@@ -1750,13 +1765,15 @@ static void test_vp_taint_missing_owned_detects_empty_taint(void **state) {
   afl.vp_frontier[0 * span + 0].dist = 5;
   vp_taint_rebuild_owned_sites(&afl, &q);
 
-  assert_int_equal(vp_taint_has_missing_owned_sites(&afl, &q), 1);
+  assert_int_equal(vp_taint_covers_owned_sites(&q), 0);
+  assert_true(q.vp_taint_generation != q.vp_owned_sites_generation);
 
   ck_free(afl.vp_frontier);
 
 }
 
-static void test_vp_taint_analyzed_empty_result_is_not_missing(void **state) {
+static void test_vp_taint_analyzed_empty_result_is_current_when_owned_covered(
+    void **state) {
 
   (void)state;
 
@@ -1795,10 +1812,214 @@ static void test_vp_taint_analyzed_empty_result_is_not_missing(void **state) {
   afl.vp_frontier[0 * span + 0].dist = 5;
   vp_taint_rebuild_owned_sites(&afl, &q);
 
-  assert_int_equal(vp_taint_has_missing_owned_sites(&afl, &q), 0);
+  assert_int_equal(vp_taint_covers_owned_sites(&q), 1);
+  assert_int_equal(q.vp_taint_generation, q.vp_owned_sites_generation);
 
   vp_taint_free(&q);
   ck_free(afl.vp_frontier);
+
+}
+
+static void test_vp_taint_owned_generation_tracks_unique_site_set(
+    void **state) {
+
+  (void)state;
+
+  afl_state_t        afl;
+  struct queue_entry q;
+  size_t             frontier_n;
+  size_t             span;
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q, 0, sizeof(q));
+
+  afl.value_profile_active = 1;
+  afl.value_profile_level = 1;
+  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
+  afl.value_profile_slots = 2;
+
+  frontier_n = (size_t)CMP_MAP_W * afl.value_profile_slots *
+               VP_RUNTIME_SLOT_REPLICA_LIMIT;
+  afl.vp_frontier = ck_alloc(frontier_n * sizeof(vp_frontier_entry_t));
+  assert_non_null(afl.vp_frontier);
+  for (size_t i = 0; i < frontier_n; ++i) {
+
+    afl.vp_frontier[i].dist = VP_DIST_UNSOLVED;
+
+  }
+
+  span = vp_taint_frontier_span(afl.value_profile_slots);
+  afl.vp_frontier[0 * span + 0].owner = &q;
+  afl.vp_frontier[0 * span + 0].dist = 5;
+  vp_taint_rebuild_owned_sites(&afl, &q);
+  assert_int_equal(q.vp_owned_sites_generation, 1);
+
+  afl.vp_frontier[0 * span + 0].owner = NULL;
+  afl.vp_frontier[0 * span + 0].dist = VP_DIST_UNSOLVED;
+  afl.vp_frontier[0 * span + 1].owner = &q;
+  afl.vp_frontier[0 * span + 1].dist = 5;
+  vp_taint_rebuild_owned_sites(&afl, &q);
+  assert_int_equal(q.vp_owned_sites_generation, 1);
+
+  afl.vp_frontier[1 * span + 0].owner = &q;
+  afl.vp_frontier[1 * span + 0].dist = 5;
+  vp_taint_rebuild_owned_sites(&afl, &q);
+  assert_int_equal(q.vp_owned_sites_generation, 2);
+
+  afl.vp_frontier[1 * span + 0].owner = NULL;
+  afl.vp_frontier[1 * span + 0].dist = VP_DIST_UNSOLVED;
+  vp_taint_rebuild_owned_sites(&afl, &q);
+  assert_int_equal(q.vp_owned_sites_generation, 3);
+
+  ck_free(q.vp_owned_sites);
+  ck_free(afl.vp_frontier);
+
+}
+
+static void test_vp_taint_state_load_marks_current_when_owned_sites_covered(
+    void **state) {
+
+  (void)state;
+
+  afl_state_t        afl;
+  struct queue_entry q_save, q_load;
+  char               tmp_tpl[] = "/tmp/afl-vp-taint-load-current-XXXXXX";
+  char              *tmp_dir = mkdtemp(tmp_tpl);
+  char               state_file[PATH_MAX];
+  u8                *fname = NULL;
+
+  assert_non_null(tmp_dir);
+  vp_taint_mk_state_dirs(tmp_dir);
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q_save, 0, sizeof(q_save));
+  memset(&q_load, 0, sizeof(q_load));
+
+  afl.out_dir = (u8 *)tmp_dir;
+  afl.perm = 0600;
+  afl.value_profile_level = 1;
+  afl.value_profile_slots = 1;
+
+  fname = alloc_printf("%s/queue/id:000008", tmp_dir);
+  q_save.fname = fname;
+  q_save.len = VP_TAINT_TEST_LEN;
+  q_save.vp_taint_done = 1;
+  q_save.vp_taint_analyzed_cnt = 1;
+  q_save.vp_taint_analyzed_sites = ck_alloc(sizeof(u16));
+  q_save.vp_taint_analyzed_sites[0] = 5;
+
+  vp_taint_save_state(&afl, &q_save);
+
+  q_load.fname = fname;
+  q_load.len = VP_TAINT_TEST_LEN;
+  q_load.vp_owned_sites = ck_alloc(sizeof(u16));
+  q_load.vp_owned_sites[0] = 5;
+  q_load.vp_owned_site_cnt = 1;
+  q_load.vp_owned_site_cap = 1;
+  q_load.vp_owned_sites_generation = 7;
+  vp_taint_load_state(&afl, &q_load);
+
+  assert_int_equal(q_load.vp_taint_done, 1);
+  assert_int_equal(q_load.vp_taint_generation, 7);
+  assert_int_equal(q_load.vp_taint_stale_visits, 0);
+  assert_int_equal(vp_taint_covers_owned_sites(&q_load), 1);
+
+  vp_taint_free(&q_load);
+  vp_taint_free(&q_save);
+  ck_free(q_load.vp_owned_sites);
+  ck_free(fname);
+
+  snprintf(state_file, sizeof(state_file), "%s/queue/.state/vp_taint/id:000008",
+           tmp_dir);
+  unlink(state_file);
+
+  {
+
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/queue/.state/vp_taint", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue/.state/deterministic_done", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue/.state", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue", tmp_dir);
+    rmdir(p);
+    rmdir(tmp_dir);
+
+  }
+
+}
+
+static void test_vp_taint_state_load_marks_stale_when_owned_site_missing(
+    void **state) {
+
+  (void)state;
+
+  afl_state_t        afl;
+  struct queue_entry q_save, q_load;
+  char               tmp_tpl[] = "/tmp/afl-vp-taint-load-stale-XXXXXX";
+  char              *tmp_dir = mkdtemp(tmp_tpl);
+  char               state_file[PATH_MAX];
+  u8                *fname = NULL;
+
+  assert_non_null(tmp_dir);
+  vp_taint_mk_state_dirs(tmp_dir);
+
+  memset(&afl, 0, sizeof(afl));
+  memset(&q_save, 0, sizeof(q_save));
+  memset(&q_load, 0, sizeof(q_load));
+
+  afl.out_dir = (u8 *)tmp_dir;
+  afl.perm = 0600;
+  afl.value_profile_level = 1;
+  afl.value_profile_slots = 1;
+
+  fname = alloc_printf("%s/queue/id:000009", tmp_dir);
+  q_save.fname = fname;
+  q_save.len = VP_TAINT_TEST_LEN;
+  q_save.vp_taint_done = 1;
+  q_save.vp_taint_analyzed_cnt = 1;
+  q_save.vp_taint_analyzed_sites = ck_alloc(sizeof(u16));
+  q_save.vp_taint_analyzed_sites[0] = 5;
+
+  vp_taint_save_state(&afl, &q_save);
+
+  q_load.fname = fname;
+  q_load.len = VP_TAINT_TEST_LEN;
+  q_load.vp_owned_sites = ck_alloc(sizeof(u16));
+  q_load.vp_owned_sites[0] = 6;
+  q_load.vp_owned_site_cnt = 1;
+  q_load.vp_owned_site_cap = 1;
+  q_load.vp_owned_sites_generation = 7;
+  vp_taint_load_state(&afl, &q_load);
+
+  assert_int_equal(q_load.vp_taint_done, 1);
+  assert_int_equal(q_load.vp_taint_generation, 0);
+  assert_int_equal(vp_taint_covers_owned_sites(&q_load), 0);
+
+  vp_taint_free(&q_load);
+  vp_taint_free(&q_save);
+  ck_free(q_load.vp_owned_sites);
+  ck_free(fname);
+
+  snprintf(state_file, sizeof(state_file), "%s/queue/.state/vp_taint/id:000009",
+           tmp_dir);
+  unlink(state_file);
+
+  {
+
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/queue/.state/vp_taint", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue/.state/deterministic_done", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue/.state", tmp_dir);
+    rmdir(p);
+    snprintf(p, sizeof(p), "%s/queue", tmp_dir);
+    rmdir(p);
+    rmdir(tmp_dir);
+
+  }
 
 }
 
@@ -2003,7 +2224,7 @@ static void test_vp_taint_analyze_resumes_after_timeout(void **state) {
 
 }
 
-static void test_vp_taint_resume_restarts_after_owner_generation_change(
+static void test_vp_taint_resume_restarts_after_owned_sites_generation_change(
     void **state) {
 
   (void)state;
@@ -2075,7 +2296,6 @@ static void test_vp_taint_resume_restarts_after_owner_generation_change(
   afl.vp_frontier[1 * span + 0].owner = &q;
   afl.vp_frontier[1 * span + 0].dist = 5;
   vp_taint_rebuild_owned_sites(&afl, &q);
-  q.vp_taint_owner_generation++;
 
   vp_taint_fake_time_ms = 0;
   vp_taint_fake_time_step = 1;
@@ -2144,13 +2364,16 @@ int main(int argc, char **argv) {
       cmocka_unit_test(test_vp_taint_state_save_and_load),
       cmocka_unit_test(test_vp_taint_state_load_rejects_truncated_file),
       cmocka_unit_test(test_vp_taint_state_save_and_load_empty_result),
+      cmocka_unit_test(test_vp_taint_state_load_marks_current_when_owned_sites_covered),
+      cmocka_unit_test(test_vp_taint_state_load_marks_stale_when_owned_site_missing),
       cmocka_unit_test(test_vp_taint_keeps_initial_result_when_owned_sites_change),
-      cmocka_unit_test(test_vp_taint_missing_owned_detects_empty_taint),
-      cmocka_unit_test(test_vp_taint_analyzed_empty_result_is_not_missing),
+      cmocka_unit_test(test_vp_taint_unanalyzed_empty_result_does_not_cover_owned),
+      cmocka_unit_test(test_vp_taint_analyzed_empty_result_is_current_when_owned_covered),
+      cmocka_unit_test(test_vp_taint_owned_generation_tracks_unique_site_set),
       cmocka_unit_test(test_vp_taint_second_call_is_noop_after_completion),
       cmocka_unit_test(test_vp_taint_analyze_resumes_after_timeout),
       cmocka_unit_test(
-          test_vp_taint_resume_restarts_after_owner_generation_change)};
+          test_vp_taint_resume_restarts_after_owned_sites_generation_change)};
 
   __real_exit(cmocka_run_group_tests(tests, NULL, NULL));
 

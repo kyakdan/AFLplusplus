@@ -418,6 +418,13 @@ static inline u8 vp_taint_ready(const struct queue_entry *q) {
 
 }
 
+static inline u8 vp_taint_is_stale(const struct queue_entry *q) {
+
+  return (u8)(q && q->vp_taint_done && !q->vp_taint_resume &&
+              q->vp_taint_generation != q->vp_owned_sites_generation);
+
+}
+
 static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
                                    u8 splice_cycle) {
 
@@ -429,13 +436,17 @@ static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
 
   u8 taint_refresh_triggered = 0;
 
-  if (vp_taint_ready(q) && q->vp_taint_needs_refresh && !q->vp_taint_resume) {
+  if (vp_taint_ready(q)) {
 
-    if (vp_taint_has_missing_owned_sites(afl, q)) {
+    if (!vp_taint_is_stale(q)) {
 
-      if (q->vp_taint_refresh_streak < (u16)~0) q->vp_taint_refresh_streak++;
+      q->vp_taint_stale_visits = 0;
+
+    } else if (!q->vp_taint_resume) {
+
+      if (q->vp_taint_stale_visits < (u16)~0) { q->vp_taint_stale_visits++; }
       if (!q->vp_taint_refresh_cooldown &&
-          q->vp_taint_refresh_streak >= VP_TAINT_REFRESH_MISMATCH_ROUNDS) {
+          q->vp_taint_stale_visits >= VP_TAINT_REFRESH_MISMATCH_ROUNDS) {
 
         /* Rebuild taint for persistent ownership drift. Existing taint is
            cleared by vp_taint_analyze() when vp_taint_done is false. */
@@ -443,11 +454,6 @@ static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
         taint_refresh_triggered = 1;
 
       }
-
-    } else {
-
-      q->vp_taint_needs_refresh = 0;
-      q->vp_taint_refresh_streak = 0;
 
     }
 
@@ -463,8 +469,7 @@ static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
 
   if (taint_refresh_triggered && vp_taint_ready(q)) {
 
-    q->vp_taint_needs_refresh = 0;
-    q->vp_taint_refresh_streak = 0;
+    q->vp_taint_stale_visits = 0;
     q->vp_taint_refresh_cooldown = VP_TAINT_REFRESH_COOLDOWN_ROUNDS;
 
   }
@@ -6940,3 +6945,4 @@ u8 fuzz_one(afl_state_t *afl) {
   return (key_val_lv_1 | key_val_lv_2);
 
 }
+

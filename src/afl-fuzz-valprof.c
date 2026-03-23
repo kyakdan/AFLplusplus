@@ -748,6 +748,7 @@ static inline void vp_owned_site_add(struct queue_entry *q, u16 site_id) {
 
   q->vp_owned_sites[pos] = site_id;
   ++q->vp_owned_site_cnt;
+  vp_taint_note_owned_sites_changed(q);
 
 }
 
@@ -767,6 +768,7 @@ static inline void vp_owned_site_remove(struct queue_entry *q, u16 site_id) {
   }
 
   --q->vp_owned_site_cnt;
+  vp_taint_note_owned_sites_changed(q);
 
 }
 
@@ -815,8 +817,6 @@ static inline void vp_dec_ref(afl_state_t *afl, struct queue_entry *q) {
 
   if (!q || !q->vp_ref_cnt) return;
   --q->vp_ref_cnt;
-  ++q->vp_taint_owner_generation;
-  if (q->vp_taint_done || q->vp_taint_resume) { q->vp_taint_needs_refresh = 1; }
   if (!q->vp_ref_cnt) {
 
     if (q->vp_trim_deferred) {
@@ -838,8 +838,6 @@ static inline void vp_inc_ref(struct queue_entry *q) {
 
   if (!q) return;
   ++q->vp_ref_cnt;
-  ++q->vp_taint_owner_generation;
-  if (q->vp_taint_done || q->vp_taint_resume) { q->vp_taint_needs_refresh = 1; }
 
 }
 

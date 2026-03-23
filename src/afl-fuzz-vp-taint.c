@@ -70,7 +70,7 @@ struct vp_taint_resume {
   u32                    *sensitive_caps;
   u32                   **sensitive_bufs;
   u32                     exec_cnt;
-  u32                     owner_generation;
+  u32                     owned_sites_generation;
 
 };
 
@@ -226,6 +226,22 @@ static inline u8 vp_taint_analyzed_site_contains(const struct queue_entry *q,
 
 }
 
+static inline void vp_taint_mark_current(struct queue_entry *q) {
+
+  if (!q) return;
+  q->vp_taint_generation = q->vp_owned_sites_generation;
+  q->vp_taint_stale_visits = 0;
+
+}
+
+static inline void vp_taint_clear_refresh_state(struct queue_entry *q) {
+
+  if (!q) return;
+  q->vp_taint_stale_visits = 0;
+  q->vp_taint_refresh_cooldown = 0;
+
+}
+
 /* Check whether queue entry q owns any frontier slot for the given site. */
 u8 vp_taint_site_owned(afl_state_t *afl, u16 site_id, struct queue_entry *q) {
 
@@ -233,36 +249,6 @@ u8 vp_taint_site_owned(afl_state_t *afl, u16 site_id, struct queue_entry *q) {
   if (!q || !q->vp_owned_sites) return 0;
   return vp_taint_site_array_contains(q->vp_owned_sites, q->vp_owned_site_cnt,
                                       site_id);
-
-}
-
-u8 vp_taint_has_missing_owned_sites(afl_state_t *afl, struct queue_entry *q) {
-
-  if (!afl || !q || !q->vp_ref_cnt || !q->vp_taint_done) return 0;
-
-  if (!q->vp_owned_site_cnt) return 0;
-
-  u32 analyzed_idx = 0;
-  for (u32 owned_idx = 0; owned_idx < q->vp_owned_site_cnt; ++owned_idx) {
-
-    u16 site_id = q->vp_owned_sites[owned_idx];
-    while (analyzed_idx < q->vp_taint_analyzed_cnt &&
-           q->vp_taint_analyzed_sites[analyzed_idx] < site_id) {
-
-      ++analyzed_idx;
-
-    }
-
-    if (analyzed_idx >= q->vp_taint_analyzed_cnt ||
-        q->vp_taint_analyzed_sites[analyzed_idx] != site_id) {
-
-      return 1;
-
-    }
-
-  }
-
-  return 0;
 
 }
 
@@ -1109,8 +1095,9 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
   q->vp_taint = loaded;
   q->vp_taint_cnt = hdr.sensitive_site_cnt;
   q->vp_taint_done = 1;
-  q->vp_taint_needs_refresh = 0;
-  q->vp_taint_refresh_streak = 0;
+  q->vp_taint_generation = 0;
+  q->vp_taint_stale_visits = 0;
+  if (vp_taint_covers_owned_sites(q)) { vp_taint_mark_current(q); }
 
 }
 
@@ -1123,15 +1110,15 @@ void vp_taint_analyze(afl_state_t *afl, struct queue_entry *q) {
   if (!afl->shm.vp_map) return;
   if (q->len < 2) return;
 
-  if (q->vp_taint_resume &&
-      q->vp_taint_resume->owner_generation != q->vp_taint_owner_generation) {
+  if (q->vp_taint_resume && q->vp_taint_resume->owned_sites_generation !=
+                                q->vp_owned_sites_generation) {
 
     vp_taint_resume_free(q);
 
   }
 
-  /* One-time per-entry analysis. Once persisted, keep and reuse it
-     independently of later frontier ownership churn. */
+  /* One analysis per owned-site generation. Callers decide when stale taint
+     should be rebuilt by clearing vp_taint_done before re-entering here. */
   if (q->vp_taint_done && !q->vp_taint_resume) return;
 
   if (!q->vp_taint_done && q->vp_taint && !q->vp_taint_resume) {
@@ -1150,7 +1137,7 @@ void vp_taint_analyze(afl_state_t *afl, struct queue_entry *q) {
     /* First run for this entry: collect baseline and build phase-2 plan. */
     vp_taint_resume_t *st = ck_alloc(sizeof(vp_taint_resume_t));
     q->vp_taint_resume = st;
-    st->owner_generation = q->vp_taint_owner_generation;
+    st->owned_sites_generation = q->vp_owned_sites_generation;
 
     collect_owned_sites(afl, q, &st->owned_sites, &st->n_owned);
     if (!st->n_owned) {
@@ -1269,8 +1256,7 @@ finalize_resume:
   }
 
   q->vp_taint_done = 1;
-  q->vp_taint_needs_refresh = 0;
-  q->vp_taint_refresh_streak = 0;
+  vp_taint_mark_current(q);
 
   vp_taint_save_state(afl, q);
 
@@ -1318,9 +1304,8 @@ void vp_taint_free(struct queue_entry *q) {
     q->vp_taint_analyzed_sites = NULL;
     q->vp_taint_analyzed_cnt = 0;
     q->vp_taint_done = 0;
-    q->vp_taint_needs_refresh = 0;
-    q->vp_taint_refresh_streak = 0;
-    q->vp_taint_refresh_cooldown = 0;
+    q->vp_taint_generation = 0;
+    vp_taint_clear_refresh_state(q);
 
     return;
 
@@ -1333,8 +1318,8 @@ void vp_taint_free(struct queue_entry *q) {
   q->vp_taint_analyzed_sites = NULL;
   q->vp_taint_analyzed_cnt = 0;
   q->vp_taint_done = 0;
-  q->vp_taint_needs_refresh = 0;
-  q->vp_taint_refresh_streak = 0;
-  q->vp_taint_refresh_cooldown = 0;
+  q->vp_taint_generation = 0;
+  vp_taint_clear_refresh_state(q);
 
 }
+

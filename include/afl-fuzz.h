@@ -325,11 +325,11 @@ struct queue_entry {
   fs_meta_t *fs_meta;                   /* Frameshift metadata              */
 
   /* VP taint analysis */
-  u8                    vp_taint_done;  /* taint analysis completed?        */
-  u8                    vp_taint_needs_refresh;  /* ownership drift hint     */
-  u16                   vp_taint_refresh_streak; /* persistent mismatch cnt  */
-  u16                   vp_taint_refresh_cooldown; /* refresh backoff visits */
-  u32                   vp_taint_owner_generation; /* owned-site snapshot gen */
+  u8  vp_taint_done;                    /* taint analysis completed?        */
+  u16 vp_taint_stale_visits;                   /* stale-visit counter       */
+  u16 vp_taint_refresh_cooldown;                  /* refresh backoff visits */
+  u32 vp_taint_generation;              /* generation current taint matches */
+  u32 vp_owned_sites_generation;              /* current owned-site set gen */
   struct vp_taint_site *vp_taint;       /* per-site taint masks (array)     */
   u32                   vp_taint_cnt;        /* # per-site taint entries    */
   u16                  *vp_taint_analyzed_sites; /* all analyzed VP sites    */
@@ -1435,9 +1435,63 @@ void vp_runtime_clear_site_filter(afl_state_t *);
 
 /* VP taint analysis (afl-fuzz-vp-taint.c) */
 
+static inline u8 vp_taint_covers_owned_sites(const struct queue_entry *q) {
+
+  if (!q) return 0;
+  if (!q->vp_owned_site_cnt) return 1;
+  if (!q->vp_taint_analyzed_sites) return 0;
+
+  u32 analyzed_idx = 0;
+  for (u32 owned_idx = 0; owned_idx < q->vp_owned_site_cnt; ++owned_idx) {
+
+    u16 site_id = q->vp_owned_sites[owned_idx];
+    while (analyzed_idx < q->vp_taint_analyzed_cnt &&
+           q->vp_taint_analyzed_sites[analyzed_idx] < site_id) {
+
+      ++analyzed_idx;
+
+    }
+
+    if (analyzed_idx >= q->vp_taint_analyzed_cnt ||
+        q->vp_taint_analyzed_sites[analyzed_idx] != site_id) {
+
+      return 0;
+
+    }
+
+  }
+
+  return 1;
+
+}
+
+static inline void vp_taint_note_owned_sites_changed(struct queue_entry *q) {
+
+  if (!q) return;
+
+  if (!q->vp_owned_sites_generation) {
+
+    q->vp_owned_sites_generation = 1;
+
+  } else {
+
+    ++q->vp_owned_sites_generation;
+    if (!q->vp_owned_sites_generation) { q->vp_owned_sites_generation = 1; }
+
+  }
+
+  if (q->vp_taint_done && !q->vp_taint_resume &&
+      vp_taint_covers_owned_sites(q)) {
+
+    q->vp_taint_generation = q->vp_owned_sites_generation;
+    q->vp_taint_stale_visits = 0;
+
+  }
+
+}
+
 void vp_taint_analyze(afl_state_t *, struct queue_entry *);
 u8   vp_taint_site_owned(afl_state_t *, u16, struct queue_entry *);
-u8   vp_taint_has_missing_owned_sites(afl_state_t *, struct queue_entry *);
 u32  vp_taint_rand_pos(afl_state_t *, vp_taint_site_t *, u32);
 void vp_taint_free(struct queue_entry *);
 void vp_taint_resume_free(struct queue_entry *);
@@ -1716,3 +1770,4 @@ static inline u8 bitmap_read(u8 *map, u32 index) {
 #endif
 
 #endif
+
