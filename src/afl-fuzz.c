@@ -1986,6 +1986,8 @@ int main(int argc, char **argv_orig, char **envp) {
         afl->value_profile_mode,
         afl->value_profile_mode == 1 ? " (always on)" : " (stagnation)",
         afl->value_profile_slots, vp_slot_replicas, "runtime-shm");
+    OKF("Value profile taint: %s",
+        afl->afl_env.afl_value_profile_taint ? "enabled" : "disabled");
 
   }
 

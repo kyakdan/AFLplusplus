@@ -32,6 +32,9 @@ same comparison site do not overwrite each other immediately.
 Runtime VP can run a per-entry taint analysis that answers a narrower question:
 which input byte positions affect the owned VP sites for this queue entry?
 
+This analysis is optional and is only enabled when
+`AFL_VALUE_PROFILE_TAINT=1` is set for `afl-fuzz`.
+
 The current implementation is observational:
 
 - it only runs for entries that currently own VP frontier sites

@@ -1944,9 +1944,13 @@ void nuke_resume_dir(afl_state_t *afl) {
   if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
   ck_free(fn);
 
-  fn = alloc_printf("%s/_resume/.state/vp_taint", afl->out_dir);
-  if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
-  ck_free(fn);
+  if (afl->afl_env.afl_value_profile_taint) {
+
+    fn = alloc_printf("%s/_resume/.state/vp_taint", afl->out_dir);
+    if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
+    ck_free(fn);
+
+  }
 
   fn = alloc_printf("%s/_resume/.state", afl->out_dir);
   if (rmdir(fn) && errno != ENOENT) { goto dir_cleanup_failed; }
@@ -2101,9 +2105,13 @@ static void handle_existing_out_dir(afl_state_t *afl) {
   if (delete_files(fn, "auto_")) { goto dir_cleanup_failed; }
   ck_free(fn);
 
-  fn = alloc_printf("%s/queue/.state/vp_taint", afl->out_dir);
-  if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
-  ck_free(fn);
+  if (afl->afl_env.afl_value_profile_taint) {
+
+    fn = alloc_printf("%s/queue/.state/vp_taint", afl->out_dir);
+    if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
+    ck_free(fn);
+
+  }
 
   fn = alloc_printf("%s/queue/.state/redundant_edges", afl->out_dir);
   if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
@@ -2455,11 +2463,14 @@ void setup_dirs_fds(afl_state_t *afl) {
   if (mkdir(tmp, afl->dir_perm)) { PFATAL("Unable to create '%s'", tmp); }
   ck_free(tmp);
 
-  /* Directory for persisted VP taint analysis results. */
+  if (afl->afl_env.afl_value_profile_taint) {
 
-  tmp = alloc_printf("%s/queue/.state/vp_taint/", afl->out_dir);
-  if (mkdir(tmp, afl->dir_perm)) { PFATAL("Unable to create '%s'", tmp); }
-  ck_free(tmp);
+    /* Directory for persisted VP taint analysis results. */
+    tmp = alloc_printf("%s/queue/.state/vp_taint/", afl->out_dir);
+    if (mkdir(tmp, afl->dir_perm)) { PFATAL("Unable to create '%s'", tmp); }
+    ck_free(tmp);
+
+  }
 
   /* Sync directory for keeping track of cooperating fuzzers. */
 

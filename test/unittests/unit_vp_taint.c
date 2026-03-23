@@ -652,6 +652,7 @@ static void vp_taint_run_analysis(u32 value_profile_slots,
   memset(&q, 0, sizeof(q));
 
   afl.value_profile_active = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = value_profile_slots;
   afl.fixed_seed = 1;
   afl.rand_seed[0] = 1;
@@ -986,6 +987,7 @@ static void test_vp_taint_phase1_inconclusive_exec_is_conservative(void **state)
   memset(&q, 0, sizeof(q));
 
   afl.value_profile_active = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
   afl.fixed_seed = 1;
   afl.rand_seed[0] = 1;
@@ -1091,6 +1093,7 @@ static void test_vp_taint_phase2_inconclusive_exec_advances_progress(
   memset(&q, 0, sizeof(q));
 
   afl.value_profile_active = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
   afl.fixed_seed = 1;
   afl.rand_seed[0] = 1;
@@ -1201,6 +1204,7 @@ static void test_vp_taint_exec_restores_state_on_error_and_stopsoon(
   memset(&q, 0, sizeof(q));
 
   afl.value_profile_active = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
 
   afl.shm.vp_map = ck_alloc(sizeof(vp_map_t));
@@ -1288,6 +1292,7 @@ static void test_vp_taint_exec_filters_non_owned_sites(void **state) {
   memset(&q, 0, sizeof(q));
 
   afl.value_profile_active = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
 
   afl.shm.vp_map = ck_alloc(sizeof(vp_map_t));
@@ -1448,6 +1453,7 @@ static void test_vp_taint_state_save_and_load(void **state) {
   afl.out_dir = (u8 *)tmp_dir;
   afl.perm = 0600;
   afl.value_profile_mode = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
 
   fname = alloc_printf("%s/queue/id:000001", tmp_dir);
@@ -1528,6 +1534,7 @@ static void test_vp_taint_state_load_rejects_truncated_file(void **state) {
   afl.out_dir = (u8 *)tmp_dir;
   afl.perm = 0600;
   afl.value_profile_mode = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
 
   fname = alloc_printf("%s/queue/id:000003", tmp_dir);
@@ -1604,6 +1611,7 @@ static void test_vp_taint_state_load_rejects_unsorted_sites(void **state) {
   afl.out_dir = (u8 *)tmp_dir;
   afl.perm = 0600;
   afl.value_profile_mode = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
 
   fname = alloc_printf("%s/queue/id:000010", tmp_dir);
@@ -1681,6 +1689,7 @@ static void test_vp_taint_state_save_and_load_empty_result(void **state) {
   afl.out_dir = (u8 *)tmp_dir;
   afl.perm = 0600;
   afl.value_profile_mode = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
 
   fname = alloc_printf("%s/queue/id:000005", tmp_dir);
@@ -1757,6 +1766,7 @@ static void test_vp_taint_keeps_initial_result_when_owned_sites_change(
   memset(&q, 0, sizeof(q));
 
   afl.value_profile_active = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
   afl.fixed_seed = 1;
   afl.rand_seed[0] = 1;
@@ -1862,6 +1872,7 @@ static void test_vp_taint_unanalyzed_empty_result_does_not_cover_owned(
   memset(&q, 0, sizeof(q));
 
   afl.value_profile_active = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
 
   frontier_n = (size_t)CMP_MAP_W * afl.value_profile_slots *
@@ -1904,6 +1915,7 @@ static void test_vp_taint_analyzed_empty_result_is_current_when_owned_covered(
   memset(&q, 0, sizeof(q));
 
   afl.value_profile_active = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
 
   frontier_n = (size_t)CMP_MAP_W * afl.value_profile_slots *
@@ -1950,6 +1962,7 @@ static void test_vp_taint_owned_generation_tracks_unique_site_set(
   memset(&q, 0, sizeof(q));
 
   afl.value_profile_active = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 2;
 
   frontier_n = (size_t)CMP_MAP_W * afl.value_profile_slots *
@@ -2012,6 +2025,7 @@ static void test_vp_taint_state_load_marks_current_when_owned_sites_covered(
   afl.out_dir = (u8 *)tmp_dir;
   afl.perm = 0600;
   afl.value_profile_mode = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
 
   fname = alloc_printf("%s/queue/id:000008", tmp_dir);
@@ -2086,6 +2100,7 @@ static void test_vp_taint_state_load_marks_stale_when_owned_site_missing(
   afl.out_dir = (u8 *)tmp_dir;
   afl.perm = 0600;
   afl.value_profile_mode = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
 
   fname = alloc_printf("%s/queue/id:000009", tmp_dir);
@@ -2161,6 +2176,7 @@ static void test_vp_taint_second_call_is_noop_after_completion(void **state) {
   memset(&q, 0, sizeof(q));
 
   afl.value_profile_active = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
   afl.fixed_seed = 1;
   afl.rand_seed[0] = 1;
@@ -2259,6 +2275,7 @@ static void test_vp_taint_analyze_resumes_after_timeout(void **state) {
   memset(&q, 0, sizeof(q));
 
   afl.value_profile_active = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
   afl.fixed_seed = 1;
   afl.rand_seed[0] = 1;
@@ -2362,6 +2379,7 @@ static void test_vp_taint_resume_restarts_after_owned_sites_generation_change(
   memset(&q, 0, sizeof(q));
 
   afl.value_profile_active = 1;
+  afl.afl_env.afl_value_profile_taint = 1;
   afl.value_profile_slots = 1;
   afl.fixed_seed = 1;
   afl.rand_seed[0] = 1;

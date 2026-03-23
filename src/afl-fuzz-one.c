@@ -459,7 +459,8 @@ static inline void vp_taint_note_refresh_complete(struct queue_entry *q) {
 static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
                                    u8 splice_cycle) {
 
-  if (!afl || !q || splice_cycle || !q->vp_ref_cnt) return;
+  if (!vp_taint_feature_enabled(afl) || !q || splice_cycle || !q->vp_ref_cnt)
+    return;
 
   vp_taint_tick_refresh_cooldown(q);
 
@@ -568,7 +569,7 @@ static void vp_prepare_active_taint_sites(afl_state_t        *afl,
   *out_indices = NULL;
   *out_cnt = 0;
 
-  if (!q || !q->vp_ref_cnt) return;
+  if (!vp_taint_feature_enabled(afl) || !q || !q->vp_ref_cnt) return;
 
   vp_maybe_analyze_taint(afl, q, splice_cycle);
 
@@ -585,8 +586,8 @@ static void vp_prepare_active_taint_sites(afl_state_t        *afl,
 static u32 vp_build_sensitive_bitmap(afl_state_t *afl, struct queue_entry *q,
                                      u32 len, u8 *map) {
 
-  if (!afl || !q || !q->vp_ref_cnt || !vp_taint_ready(q) || !q->vp_taint ||
-      !len || !map)
+  if (!vp_taint_feature_enabled(afl) || !q || !q->vp_ref_cnt ||
+      !vp_taint_ready(q) || !q->vp_taint || !len || !map)
     return 0;
 
   vp_ensure_active_taint_idx_cap(afl, q->vp_taint_cnt);

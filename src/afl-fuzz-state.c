@@ -844,6 +844,13 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
             afl->afl_env.afl_value_profile_slots =
                 (u8 *)get_afl_env(afl_environment_variables[i]);
 
+          } else if (!strncmp(env, "AFL_VALUE_PROFILE_TAINT",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_value_profile_taint =
+                (u8 *)get_afl_env(afl_environment_variables[i]) != NULL;
+
           }
 
         } else {

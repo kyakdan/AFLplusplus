@@ -876,6 +876,7 @@ static void vp_taint_free_site_list(vp_taint_site_t *sites, u32 site_cnt) {
 
 static void vp_taint_save_state(afl_state_t *afl, struct queue_entry *q) {
 
+  if (!vp_taint_feature_enabled(afl)) return;
   if (!afl || !q || !q->vp_taint_done) return;
   if (!afl->value_profile_mode) return;
   if (!vp_taint_state_is_serializable(q)) return;
@@ -924,6 +925,7 @@ static void vp_taint_save_state(afl_state_t *afl, struct queue_entry *q) {
 
 void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
 
+  if (!vp_taint_feature_enabled(afl)) return;
   if (!afl || !q || q->vp_taint_done || q->vp_taint ||
       q->vp_taint_analyzed_sites || !afl->out_dir)
     return;
@@ -1072,6 +1074,7 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
 
 void vp_taint_analyze(afl_state_t *afl, struct queue_entry *q) {
 
+  if (!vp_taint_feature_enabled(afl)) return;
   if (!afl->value_profile_active) return;
   if (!q->vp_ref_cnt) return;
   if (!afl->shm.vp_map) return;

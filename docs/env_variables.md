@@ -407,12 +407,15 @@ checks or alter some of the more exotic semantics of the tool:
     Additional tuning via environment variable:
       - `AFL_VALUE_PROFILE_SLOTS=K` (default: `16`, valid: `1..16`) controls
         per-site frontier width for runtime value profiling.
+      - `AFL_VALUE_PROFILE_TAINT=1` enables the optional runtime VP taint
+        analysis used to bias mutations toward VP-sensitive bytes.
     Value profiling may help when compare operands are transformed in ways
     that make direct solve attempts less effective.
     Notes:
       - Value profiling requires binaries compiled with
         `AFL_LLVM_VALUEPROFILE=1` (or `AFL_LLVM_VALUE_PROFILE=1`).
-      - Runtime value profiling also supports per-entry VP taint analysis. See
+      - Runtime value profiling supports optional per-entry VP taint analysis
+        when `AFL_VALUE_PROFILE_TAINT=1` is set. See
         [value_profiling.md](value_profiling.md).
       - Routine-compare VP features combine matched-prefix length and
         first-difference hamming into a single progress signal.

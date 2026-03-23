@@ -583,6 +583,7 @@ typedef struct afl_env_vars {
       *afl_testcache_entries, *afl_child_kill_signal, *afl_fsrv_kill_signal,
       *afl_target_env, *afl_persistent_record, *afl_exit_on_time;
 
+  u8  afl_value_profile_taint;
   u8 *afl_value_profile_slots;
   s32 afl_pizza_mode, afl_ijon_history_limit;
 
@@ -1430,6 +1431,12 @@ u8   vp_runtime_observe_begin(afl_state_t *, const u16 *, u32, vp_site_t *,
 void vp_runtime_observe_end(afl_state_t *, const u16 *, u32, const vp_site_t *);
 
 /* VP taint analysis (afl-fuzz-vp-taint.c) */
+
+static inline u8 vp_taint_feature_enabled(const afl_state_t *afl) {
+
+  return (u8)(afl && afl->afl_env.afl_value_profile_taint);
+
+}
 
 static inline u8 vp_taint_covers_owned_sites(const struct queue_entry *q) {
 
