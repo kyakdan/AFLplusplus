@@ -1559,8 +1559,7 @@ static void test_vp_taint_state_load_rejects_truncated_file(void **state) {
                                   .len = VP_TAINT_TEST_LEN,
                                   .analyzed_site_cnt = 1,
                                   .sensitive_site_cnt = 1,
-                                  .slot_count = 1,
-                                  .source = VP_SOURCE_RUNTIME_SHM};
+                                  .slot_count = 1};
     vp_taint_file_site_t site = {.site_id = 0, .reserved = 0, .sensitive_cnt = 2};
     u16                  analyzed_site = 0;
     u32                  only_one_pos = 7;
@@ -1637,8 +1636,7 @@ static void test_vp_taint_state_load_rejects_unsorted_sites(void **state) {
                                   .len = VP_TAINT_TEST_LEN,
                                   .analyzed_site_cnt = 2,
                                   .sensitive_site_cnt = 1,
-                                  .slot_count = 1,
-                                  .source = VP_SOURCE_RUNTIME_SHM};
+                                  .slot_count = 1};
     vp_taint_file_site_t site = {.site_id = 5, .reserved = 0, .sensitive_cnt = 1};
     u16                  analyzed_sites[2] = {7, 5};
     u32                  pos = 7;

@@ -74,7 +74,6 @@ The persisted state stores:
 
 - input length
 - VP slot count
-- VP source/backend
 - the sorted analyzed-site set
 - the sorted non-empty per-site taint entries
 
@@ -82,7 +81,6 @@ On load, AFL++ rejects corrupted or incompatible state, including:
 
 - wrong input length
 - wrong VP slot count
-- wrong VP backend
 - unsorted or duplicate site ids
 - per-site entries that are not members of the analyzed-site set
 

@@ -425,6 +425,37 @@ static inline u8 vp_taint_is_stale(const struct queue_entry *q) {
 
 }
 
+static inline void vp_taint_tick_refresh_cooldown(struct queue_entry *q) {
+
+  if (q && q->vp_taint_refresh_cooldown) { q->vp_taint_refresh_cooldown--; }
+
+}
+
+static inline u8 vp_taint_note_visit(struct queue_entry *q) {
+
+  if (!vp_taint_ready(q)) return 0;
+
+  if (!vp_taint_is_stale(q)) {
+
+    q->vp_taint_stale_visits = 0;
+    return 0;
+
+  }
+
+  if (q->vp_taint_stale_visits < (u16)~0) { q->vp_taint_stale_visits++; }
+  return (u8)(!q->vp_taint_refresh_cooldown &&
+              q->vp_taint_stale_visits >= VP_TAINT_REFRESH_MISMATCH_ROUNDS);
+
+}
+
+static inline void vp_taint_note_refresh_complete(struct queue_entry *q) {
+
+  if (!q) return;
+  q->vp_taint_stale_visits = 0;
+  q->vp_taint_refresh_cooldown = VP_TAINT_REFRESH_COOLDOWN_ROUNDS;
+
+}
+
 static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
                                    u8 splice_cycle) {
 
@@ -432,30 +463,15 @@ static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
       !q->vp_ref_cnt)
     return;
 
-  if (q->vp_taint_refresh_cooldown) q->vp_taint_refresh_cooldown--;
+  vp_taint_tick_refresh_cooldown(q);
 
   u8 taint_refresh_triggered = 0;
+  if (!q->vp_taint_resume && vp_taint_note_visit(q)) {
 
-  if (vp_taint_ready(q)) {
-
-    if (!vp_taint_is_stale(q)) {
-
-      q->vp_taint_stale_visits = 0;
-
-    } else if (!q->vp_taint_resume) {
-
-      if (q->vp_taint_stale_visits < (u16)~0) { q->vp_taint_stale_visits++; }
-      if (!q->vp_taint_refresh_cooldown &&
-          q->vp_taint_stale_visits >= VP_TAINT_REFRESH_MISMATCH_ROUNDS) {
-
-        /* Rebuild taint for persistent ownership drift. Existing taint is
-           cleared by vp_taint_analyze() when vp_taint_done is false. */
-        q->vp_taint_done = 0;
-        taint_refresh_triggered = 1;
-
-      }
-
-    }
+    /* Rebuild taint for persistent ownership drift. Existing taint is
+       cleared by vp_taint_analyze() when vp_taint_done is false. */
+    q->vp_taint_done = 0;
+    taint_refresh_triggered = 1;
 
   }
 
@@ -469,8 +485,7 @@ static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
 
   if (taint_refresh_triggered && vp_taint_ready(q)) {
 
-    q->vp_taint_stale_visits = 0;
-    q->vp_taint_refresh_cooldown = VP_TAINT_REFRESH_COOLDOWN_ROUNDS;
+    vp_taint_note_refresh_complete(q);
 
   }
 
@@ -537,6 +552,16 @@ static u32 vp_collect_all_sensitive_taint_indices(const struct queue_entry *q,
 
 }
 
+static u32 vp_collect_preferred_sensitive_taint_indices(
+    const struct queue_entry *q, u32 *out_indices) {
+
+  u32 out_cnt = vp_collect_owned_sensitive_taint_indices(q, out_indices);
+  if (out_cnt) return out_cnt;
+
+  return vp_collect_all_sensitive_taint_indices(q, out_indices);
+
+}
+
 static void vp_prepare_active_taint_sites(afl_state_t        *afl,
                                           struct queue_entry *q,
                                           u8 splice_cycle, u32 **out_indices,
@@ -554,10 +579,7 @@ static void vp_prepare_active_taint_sites(afl_state_t        *afl,
   vp_ensure_active_taint_idx_cap(afl, q->vp_taint_cnt);
   *out_indices = afl->vp_taint_active_idx_buf;
 
-  *out_cnt = vp_collect_owned_sensitive_taint_indices(q, *out_indices);
-  if (*out_cnt) return;
-
-  *out_cnt = vp_collect_all_sensitive_taint_indices(q, *out_indices);
+  *out_cnt = vp_collect_preferred_sensitive_taint_indices(q, *out_indices);
   if (!*out_cnt) *out_indices = NULL;
 
 }
@@ -569,30 +591,17 @@ static u32 vp_build_sensitive_bitmap(afl_state_t *afl, struct queue_entry *q,
       !len || !map)
     return 0;
 
+  vp_ensure_active_taint_idx_cap(afl, q->vp_taint_cnt);
+  u32 *active_indices = afl->vp_taint_active_idx_buf;
+  u32  active_cnt =
+      vp_collect_preferred_sensitive_taint_indices(q, active_indices);
+  if (!active_cnt) return 0;
+
   u32 sensitive_cnt = 0;
-  u8  have_owned = 0;
-  for (u32 n = 0; n < q->vp_taint_cnt; ++n) {
+  for (u32 n = 0; n < active_cnt; ++n) {
 
-    vp_taint_site_t *node = &q->vp_taint[n];
-    if (!vp_taint_site_owned(afl, node->site_id, q)) continue;
-    have_owned = 1;
+    vp_taint_site_t *node = &q->vp_taint[active_indices[n]];
 
-    for (u32 i = 0; i < node->sensitive_cnt; i++) {
-
-      u32 pos = node->sensitive_positions[i];
-      if (pos >= len || bitmap_read(map, pos)) continue;
-      bitmap_set(map, pos);
-      sensitive_cnt++;
-
-    }
-
-  }
-
-  if (have_owned) return sensitive_cnt;
-
-  for (u32 n = 0; n < q->vp_taint_cnt; ++n) {
-
-    vp_taint_site_t *node = &q->vp_taint[n];
     for (u32 i = 0; i < node->sensitive_cnt; i++) {
 
       u32 pos = node->sensitive_positions[i];

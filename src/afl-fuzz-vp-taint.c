@@ -42,7 +42,6 @@ typedef struct {
 /* Collected execution result for taint analysis. */
 typedef struct {
 
-  u32                     n_sites;
   vp_taint_site_status_t *sites;
 
 } vp_taint_exec_result_t;
@@ -69,7 +68,6 @@ struct vp_taint_resume {
   u32                    *sensitive_cnts;
   u32                    *sensitive_caps;
   u32                   **sensitive_bufs;
-  u32                     exec_cnt;
   u32                     owned_sites_generation;
 
 };
@@ -82,7 +80,6 @@ typedef struct {
   u32 analyzed_site_cnt;
   u32 sensitive_site_cnt;
   u32 slot_count;
-  u32 source;
 
 } vp_taint_file_header_t;
 
@@ -240,16 +237,6 @@ static u8 vp_taint_state_is_serializable(const struct queue_entry *q) {
 
 }
 
-/* Check whether queue entry q owns any frontier slot for the given site. */
-u8 vp_taint_site_owned(afl_state_t *afl, u16 site_id, struct queue_entry *q) {
-
-  (void)afl;
-  if (!q || !q->vp_owned_sites) return 0;
-  return vp_sorted_u16_contains(q->vp_owned_sites, q->vp_owned_site_cnt,
-                                site_id);
-
-}
-
 /* Copy the queue entry's sorted owned-site snapshot. */
 static void collect_owned_sites(afl_state_t *afl, struct queue_entry *q,
                                 u16 **out_sites, u32 *out_cnt) {
@@ -319,7 +306,6 @@ static u8 vp_taint_exec(afl_state_t *afl, u8 *buf, u32 len, u16 *owned_sites,
   u64 cur_exec_id = vp->exec_id;
   u16 active_mask = vp_taint_site_active_mask(afl);
 
-  result->n_sites = n_owned;
   for (u32 i = 0; i < n_owned; i++) {
 
     u16 sid = owned_sites[i];
@@ -391,7 +377,7 @@ static void range_free_all(vp_taint_range_t *head) {
    remain identical, the range is neutral (no VP-sensitive bytes).
 
    Returns a bitmap of non-neutral byte positions (caller must free).
-   Updates *exec_cnt with the number of executions used. */
+   Updates *exec_cnt with the number of executions used when non-NULL. */
 static u8 *vp_taint_phase1(afl_state_t *afl, u8 *orig_buf, u8 *changed_buf,
                            u8 *changed_buf_alt, u32 len, u16 *owned_sites,
                            vp_taint_site_status_t *baseline_sites, u32 n_owned,
@@ -432,7 +418,7 @@ static u8 *vp_taint_phase1(afl_state_t *afl, u8 *orig_buf, u8 *changed_buf,
 
     }
 
-    (*exec_cnt)++;
+    if (exec_cnt) { (*exec_cnt)++; }
 
     /* Check if any owned site's VP slot state changed from baseline.
        This is the key difference from the old reachability-based
@@ -477,7 +463,7 @@ static u8 *vp_taint_phase1(afl_state_t *afl, u8 *orig_buf, u8 *changed_buf,
 
       }
 
-      (*exec_cnt)++;
+      if (exec_cnt) { (*exec_cnt)++; }
 
       for (u32 i = 0; i < n_owned; i++) {
 
@@ -642,7 +628,7 @@ static void vp_taint_phase2(afl_state_t *afl, u8 *orig_buf, u32 len,
 
       }
 
-      (*exec_cnt)++;
+      if (exec_cnt) { (*exec_cnt)++; }
 
       /* For each owned site, check reachability and VP slot-state change. */
       u8 all_resolved = 1;
@@ -904,8 +890,7 @@ static void vp_taint_save_state(afl_state_t *afl, struct queue_entry *q) {
                                 .len = q->len,
                                 .analyzed_site_cnt = q->vp_taint_analyzed_cnt,
                                 .sensitive_site_cnt = q->vp_taint_cnt,
-                                .slot_count = afl->value_profile_slots,
-                                .source = afl->value_profile_source};
+                                .slot_count = afl->value_profile_slots};
 
   int fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, afl->perm);
   if (fd < 0) return;
@@ -957,8 +942,7 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
   if (!vp_taint_read_exact(fd, &hdr, sizeof(hdr)) ||
       hdr.magic != VP_TAINT_FILE_MAGIC ||
       hdr.version != VP_TAINT_FILE_VERSION || hdr.len != q->len ||
-      hdr.slot_count != afl->value_profile_slots ||
-      hdr.source != VP_SOURCE_RUNTIME_SHM) {
+      hdr.slot_count != afl->value_profile_slots) {
 
     close(fd);
     return;
@@ -1198,7 +1182,7 @@ void vp_taint_analyze(afl_state_t *afl, struct queue_entry *q) {
 
     st->non_neutral = vp_taint_phase1(
         afl, orig_buf, changed_buf, changed_alt, q->len, st->owned_sites,
-        st->baseline_sites, st->n_owned, saved_sites, &st->exec_cnt, start_ms);
+        st->baseline_sites, st->n_owned, saved_sites, NULL, start_ms);
 
     st->sensitive_cnts = ck_alloc(st->n_owned * sizeof(u32));
     st->sensitive_caps = ck_alloc(st->n_owned * sizeof(u32));
@@ -1225,7 +1209,7 @@ void vp_taint_analyze(afl_state_t *afl, struct queue_entry *q) {
                     st->baseline_sites, st->n_owned, saved_sites,
                     st->sensitive_cnts, st->sensitive_caps, st->sensitive_bufs,
                     st->phase2_order, st->phase2_cnt, &st->phase2_next_idx,
-                    &st->exec_cnt, start_ms);
+                    NULL, start_ms);
 
     ck_free(saved_sites);
 

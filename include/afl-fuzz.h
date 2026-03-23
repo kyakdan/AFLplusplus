@@ -1553,7 +1553,6 @@ static inline void vp_taint_note_owned_sites_changed(struct queue_entry *q) {
 }
 
 void vp_taint_analyze(afl_state_t *, struct queue_entry *);
-u8   vp_taint_site_owned(afl_state_t *, u16, struct queue_entry *);
 u32  vp_taint_rand_pos(afl_state_t *, vp_taint_site_t *, u32);
 void vp_taint_free(struct queue_entry *);
 void vp_taint_resume_free(struct queue_entry *);
