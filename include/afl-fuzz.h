@@ -325,19 +325,19 @@ struct queue_entry {
   fs_meta_t *fs_meta;                   /* Frameshift metadata              */
 
   /* VP taint analysis */
-  u8  vp_taint_done;                    /* taint analysis completed?        */
-  u16 vp_taint_stale_visits;                   /* stale-visit counter       */
-  u16 vp_taint_refresh_cooldown;                  /* refresh backoff visits */
-  u32 vp_taint_generation;              /* generation current taint matches */
-  u32 vp_owned_sites_generation;              /* current owned-site set gen */
-  struct vp_taint_site *vp_taint;       /* per-site taint masks (array)     */
-  u32                   vp_taint_cnt;        /* # per-site taint entries    */
-  u16                  *vp_taint_analyzed_sites; /* all analyzed VP sites    */
-  u32                   vp_taint_analyzed_cnt;   /* # analyzed VP sites      */
-  u16                  *vp_owned_sites;      /* current owned VP sites      */
-  u32                   vp_owned_site_cnt;   /* # current owned VP sites    */
-  u32                   vp_owned_site_cap;   /* owned-site array capacity   */
-  vp_taint_resume_t    *vp_taint_resume;
+  u8  vp_taint_done;                  /* taint analysis completed?            */
+  u16 vp_taint_stale_visits;          /* stale-visit counter                  */
+  u16 vp_taint_refresh_cooldown;      /* refresh backoff visits               */
+  u32 vp_taint_generation;            /* generation current taint matches     */
+  u32 vp_owned_sites_generation;      /* current owned-site set generation    */
+  struct vp_taint_site *vp_taint;     /* sorted by site_id, non-empty only    */
+  u32                   vp_taint_cnt; /* # per-site taint entries             */
+  u16 *vp_taint_analyzed_sites;       /* sorted unique analyzed site ids      */
+  u32  vp_taint_analyzed_cnt;         /* # analyzed VP sites                  */
+  u16 *vp_owned_sites;                /* sorted unique currently owned sites  */
+  u32  vp_owned_site_cnt;             /* # current owned VP sites             */
+  u32  vp_owned_site_cap;             /* owned-site array capacity            */
+  vp_taint_resume_t *vp_taint_resume;
 
 };
 
@@ -1471,6 +1471,55 @@ static inline u8 vp_taint_covers_owned_sites(const struct queue_entry *q) {
       return 0;
 
     }
+
+  }
+
+  return 1;
+
+}
+
+static inline u32 vp_sorted_u16_lower_bound(const u16 *values, u32 cnt,
+                                            u16 needle, u8 *found) {
+
+  u32 left = 0, right = cnt;
+  while (left < right) {
+
+    u32 mid = left + ((right - left) >> 1);
+    if (values[mid] < needle) {
+
+      left = mid + 1;
+
+    } else {
+
+      right = mid;
+
+    }
+
+  }
+
+  if (found) { *found = (u8)(left < cnt && values[left] == needle); }
+  return left;
+
+}
+
+static inline u8 vp_sorted_u16_contains(const u16 *values, u32 cnt,
+                                        u16 needle) {
+
+  u8 found = 0;
+  (void)vp_sorted_u16_lower_bound(values, cnt, needle, &found);
+  return found;
+
+}
+
+static inline u8 vp_sorted_u16_is_strictly_increasing(const u16 *values,
+                                                      u32        cnt) {
+
+  if (!cnt) return 1;
+  if (!values) return 0;
+
+  for (u32 i = 1; i < cnt; ++i) {
+
+    if (values[i - 1] >= values[i]) return 0;
 
   }
 

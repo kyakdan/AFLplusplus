@@ -752,43 +752,13 @@ static inline u8 vp_is_better(u32 cand_dist, u64 cand_cost, u32 old_dist,
 
 }
 
-static inline u32 vp_owned_site_lower_bound(const struct queue_entry *q,
-                                            u16 site_id, u8 *found) {
-
-  u32 left = 0, right = q ? q->vp_owned_site_cnt : 0;
-  while (left < right) {
-
-    u32 mid = left + ((right - left) >> 1);
-    u16 mid_site = q->vp_owned_sites[mid];
-    if (mid_site < site_id) {
-
-      left = mid + 1;
-
-    } else {
-
-      right = mid;
-
-    }
-
-  }
-
-  if (found) {
-
-    *found = (u8)(q && left < q->vp_owned_site_cnt &&
-                  q->vp_owned_sites[left] == site_id);
-
-  }
-
-  return left;
-
-}
-
 static inline void vp_owned_site_add(struct queue_entry *q, u16 site_id) {
 
   if (!q) return;
 
   u8  found = 0;
-  u32 pos = vp_owned_site_lower_bound(q, site_id, &found);
+  u32 pos = vp_sorted_u16_lower_bound(q->vp_owned_sites, q->vp_owned_site_cnt,
+                                      site_id, &found);
   if (found) return;
 
   if (q->vp_owned_site_cnt == q->vp_owned_site_cap) {
@@ -818,7 +788,8 @@ static inline void vp_owned_site_remove(struct queue_entry *q, u16 site_id) {
   if (!q || !q->vp_owned_site_cnt) return;
 
   u8  found = 0;
-  u32 pos = vp_owned_site_lower_bound(q, site_id, &found);
+  u32 pos = vp_sorted_u16_lower_bound(q->vp_owned_sites, q->vp_owned_site_cnt,
+                                      site_id, &found);
   if (!found) return;
 
   if (pos + 1 < q->vp_owned_site_cnt) {

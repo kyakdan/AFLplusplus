@@ -413,6 +413,8 @@ checks or alter some of the more exotic semantics of the tool:
     Notes:
       - Level 1 requires binaries compiled with
         `AFL_LLVM_VALUEPROFILE=1` (or `AFL_LLVM_VALUE_PROFILE=1`).
+      - Level 1 also supports per-entry VP taint analysis. See
+        [value_profiling.md](value_profiling.md).
       - Level 2 requires CmpLog compare data. Source precedence is:
         inline CmpLog instrumentation in the main target first, then `-c`
         CmpLog fallback.

@@ -82,6 +82,7 @@ typedef struct {
   u32 analyzed_site_cnt;
   u32 sensitive_site_cnt;
   u32 slot_count;
+  u32 source;
 
 } vp_taint_file_header_t;
 
@@ -94,7 +95,7 @@ typedef struct {
 } vp_taint_file_site_t;
 
 #define VP_TAINT_FILE_MAGIC 0x56505431U                           /* "VPT1" */
-#define VP_TAINT_FILE_VERSION 2U
+#define VP_TAINT_FILE_VERSION 1U
 
 static void collect_owned_sites(afl_state_t *afl, struct queue_entry *q,
                                 u16 **out_sites, u32 *out_cnt);
@@ -184,48 +185,6 @@ static inline u8 vp_taint_site_state_changed(
 
 }
 
-static inline u32 vp_taint_site_array_lower_bound(const u16 *sites, u32 cnt,
-                                                  u16 site_id, u8 *found) {
-
-  u32 left = 0, right = cnt;
-  while (left < right) {
-
-    u32 mid = left + ((right - left) >> 1);
-    if (sites[mid] < site_id) {
-
-      left = mid + 1;
-
-    } else {
-
-      right = mid;
-
-    }
-
-  }
-
-  if (found) { *found = (u8)(left < cnt && sites[left] == site_id); }
-  return left;
-
-}
-
-static inline u8 vp_taint_site_array_contains(const u16 *sites, u32 cnt,
-                                              u16 site_id) {
-
-  u8 found = 0;
-  (void)vp_taint_site_array_lower_bound(sites, cnt, site_id, &found);
-  return found;
-
-}
-
-static inline u8 vp_taint_analyzed_site_contains(const struct queue_entry *q,
-                                                 u16 site_id) {
-
-  if (!q || !q->vp_taint_analyzed_sites) return 0;
-  return vp_taint_site_array_contains(q->vp_taint_analyzed_sites,
-                                      q->vp_taint_analyzed_cnt, site_id);
-
-}
-
 static inline void vp_taint_mark_current(struct queue_entry *q) {
 
   if (!q) return;
@@ -242,13 +201,52 @@ static inline void vp_taint_clear_refresh_state(struct queue_entry *q) {
 
 }
 
+static inline u8 vp_taint_sites_are_sorted(const vp_taint_site_t *sites,
+                                           u32                    cnt) {
+
+  if (!cnt) return 1;
+  if (!sites) return 0;
+
+  for (u32 i = 1; i < cnt; ++i) {
+
+    if (sites[i - 1].site_id >= sites[i].site_id) return 0;
+
+  }
+
+  return 1;
+
+}
+
+static u8 vp_taint_state_is_serializable(const struct queue_entry *q) {
+
+  if (!q) return 0;
+  if (!vp_sorted_u16_is_strictly_increasing(q->vp_taint_analyzed_sites,
+                                            q->vp_taint_analyzed_cnt))
+    return 0;
+  if (!vp_taint_sites_are_sorted(q->vp_taint, q->vp_taint_cnt)) return 0;
+  if (q->vp_taint_cnt > q->vp_taint_analyzed_cnt) return 0;
+
+  for (u32 i = 0; i < q->vp_taint_cnt; ++i) {
+
+    const vp_taint_site_t *site = &q->vp_taint[i];
+    if (!site->sensitive_cnt || !site->sensitive_positions) return 0;
+    if (!vp_sorted_u16_contains(q->vp_taint_analyzed_sites,
+                                q->vp_taint_analyzed_cnt, site->site_id))
+      return 0;
+
+  }
+
+  return 1;
+
+}
+
 /* Check whether queue entry q owns any frontier slot for the given site. */
 u8 vp_taint_site_owned(afl_state_t *afl, u16 site_id, struct queue_entry *q) {
 
   (void)afl;
   if (!q || !q->vp_owned_sites) return 0;
-  return vp_taint_site_array_contains(q->vp_owned_sites, q->vp_owned_site_cnt,
-                                      site_id);
+  return vp_sorted_u16_contains(q->vp_owned_sites, q->vp_owned_site_cnt,
+                                site_id);
 
 }
 
@@ -895,6 +893,8 @@ static void vp_taint_free_site_list(vp_taint_site_t *sites, u32 site_cnt) {
 static void vp_taint_save_state(afl_state_t *afl, struct queue_entry *q) {
 
   if (!afl || !q || !q->vp_taint_done) return;
+  if (afl->value_profile_source != VP_SOURCE_RUNTIME_SHM) return;
+  if (!vp_taint_state_is_serializable(q)) return;
 
   char fn[PATH_MAX];
   vp_taint_state_filename(afl, q, fn, sizeof(fn));
@@ -904,7 +904,8 @@ static void vp_taint_save_state(afl_state_t *afl, struct queue_entry *q) {
                                 .len = q->len,
                                 .analyzed_site_cnt = q->vp_taint_analyzed_cnt,
                                 .sensitive_site_cnt = q->vp_taint_cnt,
-                                .slot_count = afl->value_profile_slots};
+                                .slot_count = afl->value_profile_slots,
+                                .source = afl->value_profile_source};
 
   int fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, afl->perm);
   if (fd < 0) return;
@@ -944,6 +945,7 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
       q->vp_taint_analyzed_sites || !afl->out_dir)
     return;
   if (afl->value_profile_level != 1) return;
+  if (afl->value_profile_source != VP_SOURCE_RUNTIME_SHM) return;
 
   char fn[PATH_MAX];
   vp_taint_state_filename(afl, q, fn, sizeof(fn));
@@ -955,7 +957,8 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
   if (!vp_taint_read_exact(fd, &hdr, sizeof(hdr)) ||
       hdr.magic != VP_TAINT_FILE_MAGIC ||
       hdr.version != VP_TAINT_FILE_VERSION || hdr.len != q->len ||
-      hdr.slot_count != afl->value_profile_slots) {
+      hdr.slot_count != afl->value_profile_slots ||
+      hdr.source != VP_SOURCE_RUNTIME_SHM) {
 
     close(fd);
     return;
@@ -979,6 +982,13 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
     analyzed_sites = ck_alloc(hdr.analyzed_site_cnt * sizeof(u16));
     if (!vp_taint_read_exact(fd, analyzed_sites,
                              hdr.analyzed_site_cnt * sizeof(u16))) {
+
+      ok = 0;
+
+    }
+
+    if (ok && !vp_sorted_u16_is_strictly_increasing(analyzed_sites,
+                                                    hdr.analyzed_site_cnt)) {
 
       ok = 0;
 
@@ -1042,8 +1052,9 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
 
     }
 
-    if (!vp_taint_site_array_contains(analyzed_sites, hdr.analyzed_site_cnt,
-                                      site->site_id)) {
+    if ((i && loaded[i - 1].site_id >= site->site_id) ||
+        !vp_sorted_u16_contains(analyzed_sites, hdr.analyzed_site_cnt,
+                                site->site_id)) {
 
       ck_free(site->sensitive_positions);
       site->sensitive_positions = NULL;
@@ -1297,4 +1308,3 @@ void vp_taint_free(struct queue_entry *q) {
   vp_taint_clear_refresh_state(q);
 
 }
-
