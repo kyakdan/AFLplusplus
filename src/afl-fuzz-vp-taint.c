@@ -127,9 +127,7 @@ static void random_replace_vp(afl_state_t *afl, u8 *buf, u32 len) {
    which is static in afl-fuzz-valprof.c. */
 static inline size_t vp_taint_site_span(afl_state_t *afl) {
 
-  size_t replicas = (afl->value_profile_source == VP_SOURCE_RUNTIME_SHM)
-                        ? VP_RUNTIME_SLOT_REPLICA_LIMIT
-                        : 1U;
+  size_t replicas = VP_RUNTIME_SLOT_REPLICA_LIMIT;
   return (size_t)afl->value_profile_slots * replicas;
 
 }
@@ -879,7 +877,7 @@ static void vp_taint_free_site_list(vp_taint_site_t *sites, u32 site_cnt) {
 static void vp_taint_save_state(afl_state_t *afl, struct queue_entry *q) {
 
   if (!afl || !q || !q->vp_taint_done) return;
-  if (afl->value_profile_source != VP_SOURCE_RUNTIME_SHM) return;
+  if (!afl->value_profile_mode) return;
   if (!vp_taint_state_is_serializable(q)) return;
 
   char fn[PATH_MAX];
@@ -929,8 +927,7 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
   if (!afl || !q || q->vp_taint_done || q->vp_taint ||
       q->vp_taint_analyzed_sites || !afl->out_dir)
     return;
-  if (afl->value_profile_level != 1) return;
-  if (afl->value_profile_source != VP_SOURCE_RUNTIME_SHM) return;
+  if (!afl->value_profile_mode) return;
 
   char fn[PATH_MAX];
   vp_taint_state_filename(afl, q, fn, sizeof(fn));
@@ -1075,7 +1072,7 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
 
 void vp_taint_analyze(afl_state_t *afl, struct queue_entry *q) {
 
-  if (!afl->value_profile_active || afl->value_profile_level != 1) return;
+  if (!afl->value_profile_active) return;
   if (!q->vp_ref_cnt) return;
   if (!afl->shm.vp_map) return;
   if (q->len < 2) return;

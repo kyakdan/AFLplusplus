@@ -414,12 +414,6 @@ checks or alter some of the more exotic semantics of the tool:
         `AFL_LLVM_VALUEPROFILE=1` (or `AFL_LLVM_VALUE_PROFILE=1`).
       - Runtime value profiling also supports per-entry VP taint analysis. See
         [value_profiling.md](value_profiling.md).
-      - Redqueen/colorization scheduling still requires explicit `-c`.
-        Inline CmpLog availability alone does not schedule Redqueen.
-      - With Level 2 and `-c` fallback source, VP performs extra CmpLog
-        executions, so expect lower exec/sec while active.
-      - For performance, VP CmpLog fallback checks are gated to input sizes
-        `4..cmplog_max_filesize`.
       - Routine-compare VP features combine matched-prefix length and
         first-difference hamming into a single progress signal.
 

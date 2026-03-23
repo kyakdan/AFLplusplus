@@ -960,7 +960,6 @@ void afl_state_deinit(afl_state_t *afl) {
   ck_free(afl->virgin_crash);
   ck_free(afl->var_bytes);
   ck_free(afl->top_rated);
-  if (afl->virgin_val_prof) { ck_free(afl->virgin_val_prof); }
   if (afl->top_rated_vp) { ck_free(afl->top_rated_vp); }
   if (afl->top_rated_vp_dist) { ck_free(afl->top_rated_vp_dist); }
   if (afl->vp_frontier) { ck_free(afl->vp_frontier); }

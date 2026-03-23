@@ -323,7 +323,6 @@ void afl_fsrv_init(afl_forkserver_t *fsrv) {
   fsrv->real_map_size = fsrv->map_size;
   fsrv->use_fauxsrv = false;
   fsrv->use_value_profile = false;
-  fsrv->keep_cmplog_shm_env = false;
   fsrv->last_run_timed_out = false;
   fsrv->debug = false;
   fsrv->uses_crash_exitcode = false;
@@ -361,7 +360,6 @@ void afl_fsrv_init_dup(afl_forkserver_t *fsrv_to, afl_forkserver_t *from) {
   fsrv_to->allow_cores = from->allow_cores;
   fsrv_to->uses_crash_exitcode = from->uses_crash_exitcode;
   fsrv_to->crash_exitcode = from->crash_exitcode;
-  fsrv_to->keep_cmplog_shm_env = from->keep_cmplog_shm_env;
   fsrv_to->child_kill_signal = from->child_kill_signal;
   fsrv_to->fsrv_kill_signal = from->fsrv_kill_signal;
   fsrv_to->debug = from->debug;
@@ -1015,17 +1013,9 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
     struct rlimit r;
 
-    if (!fsrv->cmplog_binary && !fsrv->keep_cmplog_shm_env) {
+    if (!fsrv->cmplog_binary) {
 
-      /* Keep cmp SHM only when explicitly needed (e.g. VP L2 inline mode). */
-      unsetenv(CMPLOG_SHM_ENV_VAR);
-
-    }
-
-    if (fsrv->cmplog_binary) {
-
-      /* Keep runtime VP map isolated from the -c child execution. */
-      unsetenv(VP_SHM_ENV_VAR);
+      unsetenv(CMPLOG_SHM_ENV_VAR);  // we do not want that in non-cmplog fsrv
 
     }
 

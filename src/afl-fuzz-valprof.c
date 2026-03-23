@@ -223,85 +223,36 @@ static inline u8 compute_ins_metrics(const struct cmp_operands *op, u32 shape,
 
 }
 
-/* Re-execute the current input under the CmpLog binary so VP can inspect
-   comparison operands. Returns 1 if cmp_map is ready for VP processing. */
-u8 vp_run_cmplog(afl_state_t *afl, void *mem, u32 len) {
-
-  if (unlikely(!afl->value_profile_active ||
-               afl->value_profile_source != VP_SOURCE_CMPLOG_CHILD ||
-               !afl->cmplog_binary || !afl->shm.cmp_map))
-    return 0;
-
-  void *vp_mem = mem;
-  u32   vp_len = write_to_testcase(afl, &vp_mem, len, 0);
-
-  if (!vp_len || vp_len < 4 || vp_len > afl->cmplog_max_filesize) return 0;
-
-  memcpy(afl->map_tmp_buf, afl->fsrv.trace_bits, afl->fsrv.map_size);
-  memset(afl->shm.cmp_map->headers, 0, sizeof(afl->shm.cmp_map->headers));
-  afl->shm.cmp_map->control_len = 0;
-  afl->shm.cmp_map->control_drops = 0;
-  afl->cmplog_fsrv.custom_input = afl->fsrv.custom_input;
-  afl->cmplog_fsrv.custom_input_len = afl->fsrv.custom_input_len;
-
-  u8 result = fuzz_run_target(afl, &afl->cmplog_fsrv, afl->fsrv.exec_tmout);
-
-  memcpy(afl->fsrv.trace_bits, afl->map_tmp_buf, afl->fsrv.map_size);
-  return result == FSRV_RUN_OK;
-
-}
-
-/* Prepare per-execution VP state before running the main target:
-   - runtime source: set enabled state, bump exec epoch, reset control list
-   - inline CmpLog source: clear cmp headers for this execution. */
+/* Prepare per-execution runtime VP state before running the main target. */
 void vp_prepare_exec(afl_state_t *afl, afl_forkserver_t *fsrv) {
 
   if (!afl->value_profile_mode) return;
   if (fsrv != &afl->fsrv) return;
 
-  if (afl->value_profile_source == VP_SOURCE_RUNTIME_SHM) {
+  if (unlikely(!fsrv->use_value_profile)) {
 
-    if (unlikely(!fsrv->use_value_profile)) {
-
-      FATAL(
-          "Value profiling requires target support for value profile runtime "
-          "SHM. Recompile the target with "
-          "AFL_LLVM_VALUE_PROFILE=1 (or AFL_LLVM_VALUEPROFILE=1).");
-
-    }
-
-    if (unlikely(!afl->shm.vp_map)) {
-
-      FATAL(
-          "Value profile runtime map missing although value profiling was "
-          "selected.");
-
-    }
-
-    vp_map_t *vp = afl->shm.vp_map;
-    vp->enabled = afl->value_profile_active ? 1U : 0U;
-    if (vp->enabled) {
-
-      ++vp->exec_id;
-      if (unlikely(!vp->exec_id)) { ++vp->exec_id; }
-      vp->control_len = 0;
-
-    }
-
-    return;
+    FATAL(
+        "Value profiling requires target support for value profile runtime "
+        "SHM. Recompile the target with "
+        "AFL_LLVM_VALUE_PROFILE=1 (or AFL_LLVM_VALUEPROFILE=1).");
 
   }
 
-  if (afl->value_profile_source == VP_SOURCE_CMPLOG_INLINE &&
-      afl->value_profile_active && afl->shm.cmp_map) {
+  if (unlikely(!afl->shm.vp_map)) {
 
-    /* Inline CmpLog source: start each main execution with a clean header set
-       so VP reads only comparisons produced by this input. */
-    memset(afl->shm.cmp_map->headers, 0, sizeof(afl->shm.cmp_map->headers));
-    afl->shm.cmp_map->control_len = 0;
-    afl->shm.cmp_map->control_drops = 0;
+    FATAL(
+        "Value profile runtime map missing although value profiling was "
+        "selected.");
 
   }
+
+  vp_map_t *vp = afl->shm.vp_map;
+  vp->enabled = afl->value_profile_active ? 1U : 0U;
+  if (!vp->enabled) return;
+
+  ++vp->exec_id;
+  if (unlikely(!vp->exec_id)) { ++vp->exec_id; }
+  vp->control_len = 0;
 
 }
 
@@ -394,38 +345,6 @@ void vp_runtime_observe_end(afl_state_t *afl, const u16 *site_ids, u32 site_cnt,
 
 }
 
-/* Ensure comparison data is available for the current input and selected
-   source. Returns 1 when VP consumers can safely read compare data. */
-u8 vp_ensure_cmp_data_ready(afl_state_t *afl, void *mem, u32 len) {
-
-  if (unlikely(!afl->value_profile_active)) return 0;
-
-  if (afl->value_profile_source == VP_SOURCE_RUNTIME_SHM) {
-
-    return afl->shm.vp_map && afl->shm.vp_map->enabled;
-
-  }
-
-  if (afl->value_profile_source == VP_SOURCE_CMPLOG_INLINE ||
-      afl->value_profile_source == VP_SOURCE_CMPLOG_CHILD) {
-
-    if (unlikely(!afl->shm.cmp_map)) return 0;
-
-    if (afl->value_profile_source == VP_SOURCE_CMPLOG_INLINE) return 1;
-    if (afl->value_profile_source == VP_SOURCE_CMPLOG_CHILD) {
-
-      return vp_run_cmplog(afl, mem, len);
-
-    }
-
-    return 0;
-
-  }
-
-  return 0;
-
-}
-
 typedef struct {
 
   vp_map_t *vp;
@@ -468,212 +387,11 @@ static inline u16 vp_runtime_site_changed_mask(const vp_site_t *site,
 
 }
 
-typedef struct {
-
-  const u64 *bitmap;
-  u32        word_idx;
-  u64        bits;
-
-} vp_trigger_site_iter_t;
-
-/* Iterate cmp_map site indices present in vp_trigger_bitmap. */
-static inline void vp_trigger_site_iter_init(vp_trigger_site_iter_t *it,
-                                             const u64              *bitmap) {
-
-  it->bitmap = bitmap;
-  it->word_idx = 0;
-  it->bits = 0;
-
-}
-
-static inline u8 vp_trigger_site_iter_next(vp_trigger_site_iter_t *it,
-                                           u32                    *site) {
-
-  while (!it->bits) {
-
-    if (it->word_idx >= VP_TRIGGER_BITMAP_WORDS) return 0;
-    it->bits = it->bitmap[it->word_idx];
-    if (!it->bits) {
-
-      ++it->word_idx;
-      continue;
-
-    }
-
-  }
-
-  u32 bit = (u32)__builtin_ctzll(it->bits);
-  it->bits &= it->bits - 1;
-  *site = it->word_idx * 64U + bit;
-  if (!it->bits) ++it->word_idx;
-  return 1;
-
-}
-
-/* Clear per-exec trigger bitmap before populating it from compare data. */
-static inline void vp_reset_trigger_bitmap(afl_state_t *afl) {
-
-  memset(afl->vp_trigger_bitmap, 0, sizeof(afl->vp_trigger_bitmap));
-
-}
-
-/* Clear a single virgin bit.  Returns 1 if the bit was new. */
-static inline u32 clear_virgin_bit(u8 *virgin, u32 idx) {
-
-  u32 byte = idx >> 3;
-  u8  bit = 1 << (idx & 7);
-  if (virgin[byte] & bit) {
-
-    virgin[byte] &= ~bit;
-    return 1;
-
-  }
-
-  return 0;
-
-}
-
-/* Clamp recorded site hits to the log depth for this compare type. */
-static inline u32 vp_site_hits(const struct cmp_header *hdr) {
-
-  return MIN((u32)hdr->hits,
-             (hdr->type == CMP_TYPE_INS) ? (u32)CMP_MAP_H : (u32)CMP_MAP_RTN_H);
-
-}
-
-/* VP feature index layout.
-
-   Each CmpLog site k gets a stride of 256 slots in a flat feature space.
-   The composite index k * 256 + local_offset is fed through hash_fmix32()
-   before
-   being taken modulo the bitmap size, so every feature is independently
-   scattered across the bitmap.  Since hash_fmix32 is bijective, distinct
-   composite inputs produce distinct hash outputs - collisions come only from
-   the final modulo, not from the hash itself.
-
-   INS compares (scalar instructions):
-     hamming  feature:  k * 256 + (hamming - 1)          offsets [0, 127]
-     abs_dist feature:  k * 256 + 128 + (abs_dist - 1)   offsets [128, 255]
-     hamming ∈ [1,128], abs_dist ∈ [1,128] for wide compares (>64-bit).
-     hamming ∈ [1,64],  abs_dist ∈ [1,64]  for ≤64-bit compares.
-
-   RTN compares (memcmp/strcmp-like routines):
-     prefix   feature:  k * 512 + prefix_len * 8 + (first_diff_hamming - 1)
-     prefix_len ∈ [0,31], first_diff_hamming ∈ [1,8]     offsets [0, 255]
-     allbytes feature:  k * 512 + 256 + (sum_of_hamming - 1)
-     sum_of_hamming ∈ [1,256]                             offsets [256, 511]
-
-   Max composite value: 65535 * 512 + 511 = 33,554,943, fits in u32. */
-
-static inline u32 vp_rtn_compare_dist_allbytes(const struct cmpfn_operands *rtn,
-                                               u32 max_len, u32 prefix_len);
-
-/* Compute value profile features from the current cmp_map.
-   Check each feature against virgin_val_prof bitmap.
-   Returns the number of newly consumed value profile bits. */
-static inline u32 vp_check_cmpmap_site(struct cmp_map *cmp, u8 *virgin, u32 k) {
-
-  u32 hits = vp_site_hits(&cmp->headers[k]);
-  u32 new_bits = 0;
-
-  if (cmp->headers[k].type == CMP_TYPE_INS) {
-
-    u32 shape = SHAPE_BYTES(cmp->headers[k].shape);
-
-    for (u32 j = 0; j < hits; j++) {
-
-      u32 hamming, abs_dist;
-      if (!compute_ins_metrics(&cmp->log[k][j], shape, VP_DIST_WRAPPED,
-                               &hamming, &abs_dist))
-        continue;
-
-      /* Two features per INS compare: hamming and absolute distance.
-         Each hashed independently via hash_fmix32 for uniform scattering. */
-      u32 idx_h =
-          hash_fmix32(k * 256 + (hamming - 1)) % (VALUE_PROFILE_MAP_SIZE * 8);
-      u32 idx_a = hash_fmix32(k * 256 + 128 + (abs_dist - 1)) %
-                  (VALUE_PROFILE_MAP_SIZE * 8);
-
-      new_bits += clear_virgin_bit(virgin, idx_h);
-      new_bits += clear_virgin_bit(virgin, idx_a);
-
-    }
-
-  } else {                                                  /* CMP_TYPE_RTN */
-
-    struct cmpfn_operands *rtn = (struct cmpfn_operands *)cmp->log[k];
-
-    for (u32 j = 0; j < hits; j++) {
-
-      u32 max_len, prefix_len;
-      if (analyze_rtn_compare(&rtn[j], &max_len, &prefix_len)) { continue; }
-
-      u32 first_diff_hamming = 0;
-      if (prefix_len < max_len) {
-
-        first_diff_hamming =
-            popcount_u8(rtn[j].v0[prefix_len] ^ rtn[j].v1[prefix_len]);
-
-      }
-
-      /* Feature 1: prefix-based — per-position hamming at full resolution.
-         Each prefix advance opens 8 fresh feature slots.
-         Uses k*512 stride to avoid overlap with allbytes feature. */
-      u32 idx =
-          hash_fmix32(k * 512 + prefix_len * 8 + (first_diff_hamming - 1)) %
-          (VALUE_PROFILE_MAP_SIZE * 8);
-
-      new_bits += clear_virgin_bit(virgin, idx);
-
-      /* Feature 2: sum-of-hamming across all differing bytes.
-         Offset 256+ within the k*512 block, cleanly separated from
-         prefix offsets [0, 255]. */
-      u32 allbytes_dist =
-          vp_rtn_compare_dist_allbytes(&rtn[j], max_len, prefix_len);
-      u32 idx_a = hash_fmix32(k * 512 + 256 + (allbytes_dist - 1)) %
-                  (VALUE_PROFILE_MAP_SIZE * 8);
-
-      new_bits += clear_virgin_bit(virgin, idx_a);
-
-    }
-
-  }
-
-  return new_bits;
-
-}
-
-u32 vp_check_cmpmap(afl_state_t *afl) {
-
-  struct cmp_map *cmp = afl->shm.cmp_map;
-  u8             *virgin = afl->virgin_val_prof;
-  u32             new_bits = 0;
-
-  if (unlikely(!cmp || !virgin)) return 0;
-  vp_reset_trigger_bitmap(afl);
-
-  u8  use_cmp_control = !cmp->control_drops;
-  u32 cmp_iter_max = use_cmp_control ? cmp->control_len : (u32)CMP_MAP_W;
-  for (u32 i = 0; i < cmp_iter_max; ++i) {
-
-    u32 k = use_cmp_control ? cmp->control[i] : i;
-    if (!cmp->headers[k].hits) continue;
-
-    afl->vp_trigger_bitmap[k >> 6] |= (1ULL << (k & 63));
-    new_bits += vp_check_cmpmap_site(cmp, virgin, k);
-
-  }
-
-  return new_bits;
-
-}
-
 /* First frontier slot index for a compare site. */
 static inline u32 vp_frontier_slot_replicas(afl_state_t *afl) {
 
-  return afl->value_profile_source == VP_SOURCE_RUNTIME_SHM
-             ? VP_RUNTIME_SLOT_REPLICA_LIMIT
-             : 1U;
+  (void)afl;
+  return VP_RUNTIME_SLOT_REPLICA_LIMIT;
 
 }
 
@@ -899,8 +617,7 @@ static inline void vp_clear_slot(afl_state_t *afl, size_t idx) {
   afl->vp_frontier[idx].cost = ~(u64)0;
   afl->vp_frontier[idx].is_protected = 0;
 
-  if (afl->value_profile_source == VP_SOURCE_RUNTIME_SHM &&
-      afl->vp_runtime_slot_mask) {
+  if (afl->vp_runtime_slot_mask) {
 
     u32 site = (u32)(idx / site_span);
     u16 slot_rel = (u16)(((idx % site_span) / VP_RUNTIME_SLOT_REPLICA_LIMIT));
@@ -1036,9 +753,7 @@ static inline u32 vp_collect_runtime_site_candidates(const vp_site_t *site,
 
 void vp_mark_favored_runtime_slots(afl_state_t *afl) {
 
-  if (!afl->vp_frontier || !afl->value_profile_active ||
-      afl->value_profile_source != VP_SOURCE_RUNTIME_SHM)
-    return;
+  if (!afl->vp_frontier || !afl->value_profile_active) return;
 
   u16 slot_cfg_mask = afl->value_profile_slots == 16
                           ? 0xffffU
@@ -1580,89 +1295,6 @@ static inline u16 vp_rtn_compare_tag(u32 max_len, u8 ord_in_len_class[32]) {
 
 }
 
-/* Collect CmpLog-site (tag,dist) candidates for frontier probe/apply paths. */
-static inline u32 vp_collect_cmplog_site_candidates(struct cmp_map *cmp, u32 k,
-                                                    vp_site_candidate_t *out,
-                                                    u32                  cap) {
-
-  u32 hits = vp_site_hits(&cmp->headers[k]);
-  u32 n = 0;
-
-  if (cmp->headers[k].type == CMP_TYPE_INS) {
-
-    u32 shape = SHAPE_BYTES(cmp->headers[k].shape);
-    for (u32 j = 0; j < hits && n < cap; ++j) {
-
-      u32 hamming, abs_dist;
-      if (!compute_ins_metrics(&cmp->log[k][j], shape, VP_DIST_EXACT, &hamming,
-                               &abs_dist))
-        continue;
-
-      out[n].slot_rel = 0;
-      out[n].tag = (u16)(j & 31U);
-      out[n].dist = MIN(hamming, abs_dist);
-      out[n].is_protected = 0;
-      ++n;
-
-    }
-
-  } else {
-
-    struct cmpfn_operands *rtn = (struct cmpfn_operands *)cmp->log[k];
-    u8                     ord_in_len_class[32] = {0};
-    for (u32 j = 0; j < hits && n < cap; ++j) {
-
-      u32 max_len, prefix_len;
-      if (analyze_rtn_compare(&rtn[j], &max_len, &prefix_len)) continue;
-
-      u32 prefix_d = vp_rtn_compare_dist(&rtn[j], max_len, prefix_len);
-      u32 allbytes_d =
-          vp_rtn_compare_dist_allbytes(&rtn[j], max_len, prefix_len);
-
-      out[n].slot_rel = 0;
-      out[n].tag = vp_rtn_compare_tag(max_len, ord_in_len_class);
-      out[n].dist = MIN(prefix_d, allbytes_d);
-      out[n].is_protected = 0;
-      ++n;
-
-    }
-
-  }
-
-  return n;
-
-}
-
-/* Apply one site's candidate list to frontier slots and refresh the per-site
-   winner if needed. Returns whether any slot changed. */
-static inline u8 vp_apply_site_candidates(afl_state_t        *afl,
-                                          struct queue_entry *q, u32 site,
-                                          vp_site_candidate_t *candidates,
-                                          u32 cand_count, u64 cost) {
-
-  vp_frontier_site_ctx_t ctx;
-  vp_frontier_site_ctx_init(afl, site, cand_count ? 1 : 0, &ctx);
-
-  u8 site_changed = 0;
-  for (u32 i = 0; i < cand_count; ++i) {
-
-    if (vp_frontier_site_apply_ctx(afl, q, &ctx, candidates[i].tag,
-                                   candidates[i].dist, cost,
-                                   candidates[i].is_protected))
-      site_changed = 1;
-
-  }
-
-  if (vp_site_refresh_needed(afl, site, site_changed)) {
-
-    vp_refresh_site_winner(afl, site);
-
-  }
-
-  return site_changed;
-
-}
-
 static inline void vp_frontier_site_clear_stale(afl_state_t *afl, u32 site) {
 
   size_t base = vp_site_base(afl, site);
@@ -1722,7 +1354,6 @@ struct vp_trim_guard {
 
   afl_state_t        *afl;
   struct queue_entry *q;
-  u8                  source;
   u8                  active;
   u8                  runtime_sandboxed;
   u16                 slots;
@@ -1736,8 +1367,6 @@ struct vp_trim_guard {
   u32                 owned_cnt;
   u32                 owned_cap;
   vp_site_t          *site_backup;
-  u8                 *child_buf;
-  u32                 child_cap;
 
 };
 
@@ -1748,7 +1377,6 @@ static inline void vp_trim_guard_destroy_req(vp_trim_guard_t *guard) {
   if (guard->site_ids) { ck_free(guard->site_ids); }
   if (guard->owned_idx) { ck_free(guard->owned_idx); }
   if (guard->site_backup) { ck_free(guard->site_backup); }
-  if (guard->child_buf) { ck_free(guard->child_buf); }
   ck_free(guard);
 
 }
@@ -1893,46 +1521,15 @@ static inline u8 vp_trim_guard_eval_runtime(vp_trim_guard_t *guard) {
 
 }
 
-static inline u8 vp_trim_guard_eval_cmplog(vp_trim_guard_t *guard) {
-
-  struct cmp_map *cmp = guard->afl->shm.cmp_map;
-  if (unlikely(!cmp)) return 0;
-
-  for (u32 i = 0; i < guard->site_cnt; ++i) {
-
-    u32                 site_id = guard->site_ids[i];
-    vp_site_candidate_t candidates[CMP_MAP_H];
-    u32                 cand_count =
-        vp_collect_cmplog_site_candidates(cmp, site_id, candidates, CMP_MAP_H);
-
-    for (u32 j = 0; j < cand_count; ++j) {
-
-      vp_trim_guard_assign_candidate(guard, site_id, 0, candidates[j].tag,
-                                     candidates[j].dist);
-
-    }
-
-  }
-
-  return vp_trim_guard_all_seen(guard);
-
-}
-
 vp_trim_guard_t *vp_trim_guard_init(afl_state_t *afl, struct queue_entry *q) {
 
   if (unlikely(!afl || !q || !afl->vp_frontier || !afl->value_profile_active ||
                !q->vp_ref_cnt))
     return NULL;
 
-  if (afl->value_profile_source != VP_SOURCE_RUNTIME_SHM &&
-      afl->value_profile_source != VP_SOURCE_CMPLOG_INLINE &&
-      afl->value_profile_source != VP_SOURCE_CMPLOG_CHILD)
-    return NULL;
-
   vp_trim_guard_t *guard = ck_alloc(sizeof(vp_trim_guard_t));
   guard->afl = afl;
   guard->q = q;
-  guard->source = afl->value_profile_source;
   guard->slots = (u16)vp_frontier_site_span(afl);
 
   u32 refs_left = q->vp_ref_cnt;
@@ -1954,9 +1551,7 @@ vp_trim_guard_t *vp_trim_guard_init(afl_state_t *afl, struct queue_entry *q) {
       }
 
       vp_trim_guard_add_owned(guard, base + rel);
-      u16 slot_rel = guard->source == VP_SOURCE_RUNTIME_SHM
-                         ? (u16)(rel / VP_RUNTIME_SLOT_REPLICA_LIMIT)
-                         : 0;
+      u16 slot_rel = (u16)(rel / VP_RUNTIME_SLOT_REPLICA_LIMIT);
       vp_trim_guard_add_req(guard, site, site_req_start, slot_rel, entry->tag,
                             entry->dist);
       --refs_left;
@@ -1972,7 +1567,7 @@ vp_trim_guard_t *vp_trim_guard_init(afl_state_t *afl, struct queue_entry *q) {
 
   }
 
-  if (guard->source == VP_SOURCE_RUNTIME_SHM && guard->site_cnt) {
+  if (guard->site_cnt) {
 
     guard->site_backup = ck_alloc(guard->site_cnt * sizeof(vp_site_t));
 
@@ -1986,7 +1581,6 @@ vp_trim_guard_t *vp_trim_guard_init(afl_state_t *afl, struct queue_entry *q) {
 void vp_trim_guard_before_exec(vp_trim_guard_t *guard) {
 
   if (unlikely(!guard || !guard->active)) return;
-  if (guard->source != VP_SOURCE_RUNTIME_SHM) return;
 
   guard->runtime_sandboxed =
       vp_runtime_observe_begin(guard->afl, guard->site_ids, guard->site_cnt,
@@ -1998,63 +1592,20 @@ u8 vp_trim_guard_preserved(vp_trim_guard_t *guard, u8 *in_buf, u32 cur_len,
                            u32 remove_pos, u32 remove_len) {
 
   if (unlikely(!guard || !guard->active || !guard->req_cnt)) return 1;
+  (void)in_buf;
+  (void)cur_len;
+  (void)remove_pos;
+  (void)remove_len;
   vp_trim_guard_reset_seen(guard);
 
-  switch (guard->source) {
-
-    case VP_SOURCE_RUNTIME_SHM:
-      return vp_trim_guard_eval_runtime(guard);
-
-    case VP_SOURCE_CMPLOG_INLINE:
-      return vp_trim_guard_eval_cmplog(guard);
-
-    case VP_SOURCE_CMPLOG_CHILD: {
-
-      if (unlikely(remove_len > cur_len)) return 0;
-      /* Custom mutator trimming passes a fully-trimmed buffer with
-         (remove_pos, remove_len) = (0, 0). Use it directly and avoid the
-         synthetic gap-copy path. */
-      if (!remove_pos && !remove_len) {
-
-        if (!vp_run_cmplog(guard->afl, in_buf, cur_len)) return 0;
-        return vp_trim_guard_eval_cmplog(guard);
-
-      }
-
-      u32 child_len = cur_len - remove_len;
-      if (guard->child_cap < child_len) {
-
-        guard->child_buf = ck_realloc(guard->child_buf, child_len);
-        guard->child_cap = child_len;
-
-      }
-
-      if (remove_pos) memcpy(guard->child_buf, in_buf, remove_pos);
-      u32 tail_len = cur_len - remove_pos - remove_len;
-      if (tail_len) {
-
-        memcpy(guard->child_buf + remove_pos, in_buf + remove_pos + remove_len,
-               tail_len);
-
-      }
-
-      if (!vp_run_cmplog(guard->afl, guard->child_buf, child_len)) return 0;
-      return vp_trim_guard_eval_cmplog(guard);
-
-    }
-
-    default:
-      return 0;
-
-  }
+  return vp_trim_guard_eval_runtime(guard);
 
 }
 
 void vp_trim_guard_after_exec(vp_trim_guard_t *guard) {
 
   if (unlikely(!guard || !guard->active)) return;
-  if (guard->source != VP_SOURCE_RUNTIME_SHM || !guard->runtime_sandboxed)
-    return;
+  if (!guard->runtime_sandboxed) return;
 
   vp_runtime_observe_end(guard->afl, guard->site_ids, guard->site_cnt,
                          guard->site_backup);
@@ -2166,8 +1717,6 @@ u8 vp_frontier_would_improve(afl_state_t *afl) {
 
   if (unlikely(!afl->vp_frontier)) return 0;
 
-  assert(afl->value_profile_source == VP_SOURCE_RUNTIME_SHM);
-
   vp_map_t *vp = afl->shm.vp_map;
   if (unlikely(!vp || !vp->enabled)) return 0;
   u16                    max_slot_count = (u16)afl->value_profile_slots;
@@ -2233,52 +1782,12 @@ static inline u8 vp_apply_runtime_frontier(afl_state_t        *afl,
 
 }
 
-/* Apply CmpLog-site candidates to the VP frontier and return whether any
-   frontier slot changed. */
-static inline u8 vp_apply_cmplog_frontier(afl_state_t        *afl,
-                                          struct queue_entry *q, u64 cost) {
-
-  struct cmp_map *cmp = afl->shm.cmp_map;
-  if (unlikely(!cmp)) return 0;
-
-  u8                     improved = 0;
-  vp_trigger_site_iter_t it;
-  vp_trigger_site_iter_init(&it, afl->vp_trigger_bitmap);
-  u32 k;
-  while (vp_trigger_site_iter_next(&it, &k)) {
-
-    if (!cmp->headers[k].hits) continue;
-
-    vp_site_candidate_t candidates[CMP_MAP_H];
-    u32                 cand_count =
-        vp_collect_cmplog_site_candidates(cmp, k, candidates, CMP_MAP_H);
-    if (vp_apply_site_candidates(afl, q, k, candidates, cand_count, cost)) {
-
-      improved = 1;
-
-    }
-
-  }
-
-  return improved;
-
-}
-
 void vp_frontier_apply_with_cost(afl_state_t *afl, struct queue_entry *q,
                                  u64 cost) {
 
   if (unlikely(!q || !afl->vp_frontier)) return;
 
-  u8 improved = 0;
-  if (afl->value_profile_source == VP_SOURCE_RUNTIME_SHM) {
-
-    improved = vp_apply_runtime_frontier(afl, q, cost);
-
-  } else {
-
-    improved = vp_apply_cmplog_frontier(afl, q, cost);
-
-  }
+  u8 improved = vp_apply_runtime_frontier(afl, q, cost);
 
   if (q->vp_only && !q->vp_ref_cnt && !q->vp_last_ref_cycle) {
 
@@ -2325,18 +1834,10 @@ void vp_apply_delayed_evictions(afl_state_t *afl) {
 
 }
 
-/* Collect VP signal for one concrete input using the active VP source.
-   For child-CmpLog source, run only the CmpLog child to avoid double-running
-   the input. For runtime/inline sources, run the main target once first. */
+/* Collect runtime VP signal for one concrete input. */
 u8 vp_collect_signal_for_input(afl_state_t *afl, u8 *mem, u32 len) {
 
   if (unlikely(!afl->value_profile_active)) return 0;
-
-  if (afl->value_profile_source == VP_SOURCE_CMPLOG_CHILD) {
-
-    return vp_run_cmplog(afl, mem, len);
-
-  }
 
   void *exec_mem = mem;
   u32   exec_len = write_to_testcase(afl, &exec_mem, len, 0);
@@ -2351,7 +1852,7 @@ u8 vp_collect_signal_for_input(afl_state_t *afl, u8 *mem, u32 len) {
 
   if (fault != afl->crash_mode && fault != FSRV_RUN_NOBITS) return 0;
 
-  return vp_ensure_cmp_data_ready(afl, mem, len);
+  return afl->shm.vp_map && afl->shm.vp_map->enabled;
 
 }
 
@@ -2382,8 +1883,6 @@ static void vp_replay_queue(afl_state_t *afl) {
 
     u8 *mem = queue_testcase_get(afl, q);
     if (!vp_collect_signal_for_input(afl, mem, q->len)) continue;
-
-    if (afl->value_profile_level == 2) { (void)vp_check_cmpmap(afl); }
     vp_frontier_apply_with_cost(afl, q, vp_entry_cost(q));
 
   }

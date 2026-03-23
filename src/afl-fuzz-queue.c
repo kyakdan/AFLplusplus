@@ -756,10 +756,8 @@ void add_to_queue(afl_state_t *afl, u8 *fname, u32 len, u8 passed_det) {
 
   }
 
-  /* only redqueen currently uses is_ascii.
-     Guard with cmplog_binary (child exists), because VP inline mode can set
-     shm.cmplog_mode without starting a CmpLog child forkserver. */
-  if (unlikely(afl->cmplog_binary && !q->is_ascii)) {
+  /* only redqueen currently uses is_ascii */
+  if (unlikely(afl->shm.cmplog_mode && !q->is_ascii)) {
 
     q->is_ascii = check_if_text(afl, q);
 
@@ -1008,39 +1006,10 @@ void cull_queue(afl_state_t *afl) {
 
   }
 
-  /* Mark VP winners as favored only while VP guidance is enabled.
-     L1 favors the best retained entries within each runtime slot group.
-     L2 still uses the cached per-site winner. */
-  if (afl->vp_frontier && afl->value_profile_active &&
-      afl->value_profile_source == VP_SOURCE_RUNTIME_SHM) {
+  /* Mark VP winners as favored only while VP guidance is enabled. */
+  if (afl->vp_frontier && afl->value_profile_active) {
 
     vp_mark_favored_runtime_slots(afl);
-
-  } else if (afl->top_rated_vp && afl->value_profile_active) {
-
-    for (i = 0; i < CMP_MAP_W; ++i) {
-
-      struct queue_entry *q = afl->top_rated_vp[i];
-      if (!q || q->disabled || q->favored || afl->top_rated_vp_dist[i] == 0 ||
-          afl->top_rated_vp_dist[i] >= VP_DIST_UNSOLVED)
-        continue;
-
-      q->favored = 1;
-      ++afl->queued_favored;
-
-      if (!q->was_fuzzed) {
-
-        ++afl->pending_favored;
-        if (unlikely(afl->smallest_favored < 0 ||
-                     afl->smallest_favored > (s64)q->id)) {
-
-          afl->smallest_favored = (s64)q->id;
-
-        }
-
-      }
-
-    }
 
   }
 

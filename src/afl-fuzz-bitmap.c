@@ -690,29 +690,13 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
       if (san_fault == FSRV_RUN_OK) {
 
         /* Value profiling on non-coverage-producing executions. */
-        if (vp_ensure_cmp_data_ready(afl, mem, len)) {
+        if (afl->shm.vp_map && afl->shm.vp_map->enabled &&
+            vp_frontier_would_improve(afl)) {
 
-          u8  frontier_improved = 0;
-          u32 feature_new = 0;
-
-          if (afl->value_profile_level == 2) {
-
-            feature_new = vp_check_cmpmap(afl);
-
-          } else {
-
-            frontier_improved = vp_frontier_would_improve(afl);
-
-          }
-
-          if (feature_new || frontier_improved) {
-
-            afl->value_profile_finds++;
-            new_bits |= NEW_BITS_VP_MASK;
-            vp_entry = 1;
-            goto save_to_queue;
-
-          }
+          afl->value_profile_finds++;
+          new_bits |= NEW_BITS_VP_MASK;
+          vp_entry = 1;
+          goto save_to_queue;
 
         }
 
@@ -841,8 +825,7 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
 
     }
 
-    if (unlikely(afl->value_profile_active && afl->value_profile_level == 1 &&
-                 afl->value_profile_source == VP_SOURCE_RUNTIME_SHM)) {
+    if (unlikely(afl->value_profile_active)) {
 
       /* Preserve runtime VP state from this execution across calibration
          re-runs by temporarily disabling VP collection. */
@@ -887,12 +870,10 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
 
         vp_frontier_apply(afl, afl->queue_top);
 
-      } else if (vp_ensure_cmp_data_ready(afl, mem, len)) {
+      } else if (afl->shm.vp_map && afl->shm.vp_map->enabled) {
 
         /* Coverage-producing input: also compute VP score so the scheduler
            can see VP gradient on coverage entries too. */
-        if (afl->value_profile_level == 2) { vp_check_cmpmap(afl); }
-
         vp_frontier_apply(afl, afl->queue_top);
 
       }

@@ -1901,9 +1901,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
-  if (afl->cmplog_binary) { OKF("CmpLog level: %u", afl->cmplog_lvl); }
-
-  afl->value_profile_level = VP_LEVEL_DEFAULT;
+  if (afl->shm.cmplog_mode) { OKF("CmpLog level: %u", afl->cmplog_lvl); }
 
   afl->value_profile_slots = VP_SLOTS_DEFAULT;
   if (afl->afl_env.afl_value_profile_slots) {
@@ -1928,8 +1926,6 @@ int main(int argc, char **argv_orig, char **envp) {
   /* -r0 enables always-on runtime VP; -rN enables stagnation-triggered
      runtime VP after N seconds without new edge coverage. */
   if (vp_requested) {
-
-    afl->value_profile_level = VP_LEVEL_DEFAULT;
 
     if (vp_stagnation_secs) {
 
@@ -1962,7 +1958,6 @@ int main(int argc, char **argv_orig, char **envp) {
 
     }
 
-    afl->value_profile_source = VP_SOURCE_RUNTIME_SHM;
     afl->shm.vp_mode = 1;
 
     afl->top_rated_vp = ck_alloc(CMP_MAP_W * sizeof(void *));
@@ -2518,7 +2513,6 @@ int main(int argc, char **argv_orig, char **envp) {
 
   setup_cmdline_file(afl, argv + optind);
   u8 main_caps = BIN_CAP_NONE;
-  u8 cmplog_caps = BIN_CAP_NONE;
 
   // Let's check SAND sanitizers binaries a bit earlier
   // so that we won't overwrite target_path.
@@ -2534,8 +2528,6 @@ int main(int argc, char **argv_orig, char **envp) {
   u64 prev_target_hash = 0;
   s32 fast_resume = 0;
   u8  is_ijon_fastresume = 0;
-  u8  has_vp_fastresume = 0;
-  u8 *vp_fastresume_buf = NULL;
   #ifdef HAVE_ZLIB
   gzFile fr_fd = NULL;
   #else
@@ -2613,9 +2605,6 @@ int main(int argc, char **argv_orig, char **envp) {
                                  (sizeof(struct queue_entry) << 1);
         u64 expect_ver_with_ijon =
             expect_ver_no_ijon + sizeof(u32) + sizeof(ijon_fastresume_state_t);
-        u64 expect_ver_no_ijon_vp = expect_ver_no_ijon + VALUE_PROFILE_MAP_SIZE;
-        u64 expect_ver_with_ijon_vp =
-            expect_ver_with_ijon + VALUE_PROFILE_MAP_SIZE;
 
         if (NZLIBREAD(fr_fd, ver_string, sizeof(ver_string)) !=
             sizeof(ver_string)) {
@@ -2624,9 +2613,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
         } else {
 
-          if (*ver != expect_ver_no_ijon && *ver != expect_ver_with_ijon &&
-              *ver != expect_ver_no_ijon_vp &&
-              *ver != expect_ver_with_ijon_vp) {
+          if (*ver != expect_ver_no_ijon && *ver != expect_ver_with_ijon) {
 
             WARNF(
                 "Different AFL++ version or feature usage, cannot perform FAST "
@@ -2638,10 +2625,7 @@ int main(int argc, char **argv_orig, char **envp) {
             fast_resume = 1;
 
             /* Detect if this is an IJON fastresume file */
-            is_ijon_fastresume = (*ver == expect_ver_with_ijon ||
-                                  *ver == expect_ver_with_ijon_vp);
-            has_vp_fastresume = (*ver == expect_ver_no_ijon_vp ||
-                                 *ver == expect_ver_with_ijon_vp);
+            is_ijon_fastresume = (*ver == expect_ver_with_ijon);
 
           }
 
@@ -2749,7 +2733,7 @@ int main(int argc, char **argv_orig, char **envp) {
       u8 *saved_target_path =
           afl->fsrv.target_path ? ck_strdup(afl->fsrv.target_path) : NULL;
 
-      cmplog_caps = check_binary(afl, afl->cmplog_binary);
+      (void)check_binary(afl, afl->cmplog_binary);
 
       if (saved_target_path) {
 
@@ -2762,85 +2746,16 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
-  if (afl->value_profile_mode && afl->value_profile_level == 2) {
-
-    afl->fsrv.keep_cmplog_shm_env = false;
-
-    if (main_caps & BIN_CAP_CMPLOG) {
-
-      afl->value_profile_source = VP_SOURCE_CMPLOG_INLINE;
-
-    } else if (afl->cmplog_binary) {
-
-      afl->value_profile_source = VP_SOURCE_CMPLOG_CHILD;
-
-    } else {
-
-      afl->value_profile_source = VP_SOURCE_NONE;
-
-    }
-
-    if (afl->value_profile_source == VP_SOURCE_CMPLOG_INLINE) {
-
-      /* Level-2 inline source needs cmp_map SHM in normal executions.
-         shm.cmplog_mode means "cmp_map SHM is allocated", while
-         cmplog_binary means "a -c CmpLog child forkserver exists". */
-      afl->shm.cmplog_mode = 1;
-      afl->fsrv.keep_cmplog_shm_env = true;
-
-    }
-
-    if (afl->value_profile_source == VP_SOURCE_NONE) {
-
-      FATAL(
-          "Value profile level 2 needs CmpLog compare data. Either "
-          "compile the main target with AFL_LLVM_CMPLOG=1 (inline source) "
-          "or run afl-fuzz with -c and a CmpLog-instrumented binary.");
-
-    }
-
-    OKF("Value profiling level 2 source: %s",
-        afl->value_profile_source == VP_SOURCE_CMPLOG_INLINE
-            ? "inline CmpLog in main target"
-            : "CmpLog -c child");
-
-  }
-
   if (afl->value_profile_mode && !afl->afl_env.afl_skip_bin_check &&
       !afl->fsrv.qemu_mode && !afl->fsrv.frida_mode && !afl->fsrv.cs_mode &&
       !afl->non_instrumented_mode && !afl->unicorn_mode) {
 
-    if (afl->value_profile_source == VP_SOURCE_RUNTIME_SHM &&
-        !(main_caps & BIN_CAP_VP_RUNTIME)) {
+    if (!(main_caps & BIN_CAP_VP_RUNTIME)) {
 
       FATAL(
           "Value profiling requires runtime VP instrumentation in the main "
           "target. Recompile with AFL_LLVM_VALUE_PROFILE=1 (or "
           "AFL_LLVM_VALUEPROFILE=1).");
-
-    }
-
-    if (afl->value_profile_level == 2) {
-
-      if (afl->value_profile_source == VP_SOURCE_CMPLOG_INLINE &&
-          !(main_caps & BIN_CAP_CMPLOG)) {
-
-        FATAL(
-            "Value profile level 2 selected inline CmpLog source, but "
-            "the main target is missing CmpLog instrumentation. "
-            "Recompile with AFL_LLVM_CMPLOG=1.");
-
-      }
-
-      if (afl->value_profile_source == VP_SOURCE_CMPLOG_CHILD &&
-          !(cmplog_caps & BIN_CAP_CMPLOG)) {
-
-        FATAL(
-            "Value profile level 2 selected -c CmpLog fallback source, "
-            "but the -c binary is missing CmpLog instrumentation marker. "
-            "Recompile the -c target with AFL_LLVM_CMPLOG=1.");
-
-      }
 
     }
 
@@ -2934,9 +2849,7 @@ int main(int argc, char **argv_orig, char **envp) {
     u32 new_map_size = afl_fsrv_get_mapsize(
         &afl->fsrv, afl->argv, &afl->stop_soon, afl->afl_env.afl_debug_child);
 
-    if (afl->value_profile_mode &&
-        afl->value_profile_source == VP_SOURCE_RUNTIME_SHM &&
-        !afl->fsrv.use_value_profile) {
+    if (afl->value_profile_mode && !afl->fsrv.use_value_profile) {
 
       FATAL(
           "Value profiling requires target support for value profile runtime "
@@ -3229,14 +3142,6 @@ int main(int argc, char **argv_orig, char **envp) {
   dedup_extras(afl);
   if (afl->extras_cnt) { OKF("Loaded a total of %u extras.", afl->extras_cnt); }
 
-  /* Start with a clean VP map. If fastresume contains VP state, it will be
-     loaded below and replace this default. */
-  if (afl->virgin_val_prof) {
-
-    memset(afl->virgin_val_prof, 255, VALUE_PROFILE_MAP_SIZE);
-
-  }
-
   if (unlikely(fast_resume)) {
 
     u64 resume_start = get_cur_time_us();
@@ -3289,32 +3194,6 @@ int main(int argc, char **argv_orig, char **envp) {
 
     }
 
-    if (unlikely(has_vp_fastresume)) {
-
-      if (likely(afl->virgin_val_prof)) {
-
-        ZLIBREAD(fr_fd, afl->virgin_val_prof, VALUE_PROFILE_MAP_SIZE,
-                 "virgin_val_prof");
-
-      } else {
-
-        /* Keep fastresume stream alignment when VP is currently disabled. */
-        if (unlikely(!vp_fastresume_buf)) {
-
-          vp_fastresume_buf = ck_alloc(VALUE_PROFILE_MAP_SIZE);
-
-        }
-
-        ZLIBREAD(fr_fd, vp_fastresume_buf, VALUE_PROFILE_MAP_SIZE,
-                 "virgin_val_prof(discarded)");
-        WARNF(
-            "fastresume.bin contains value profile state, but "
-            "value profiling is disabled. Ignoring saved VP bitmap.");
-
-      }
-
-    }
-
     u8  res[1] = {0};
     u8 *o_start = (u8 *)&(afl->queue_buf[0]->colorized);
     u8 *o_end = (u8 *)&(afl->queue_buf[0]->mother);
@@ -3327,7 +3206,7 @@ int main(int argc, char **argv_orig, char **envp) {
     r = 8 +
         (afl->fsrv.use_ijon ? sizeof(u32) + sizeof(ijon_fastresume_state_t)
                             : 0) +
-        queue_map_size * 4 + (has_vp_fastresume ? VALUE_PROFILE_MAP_SIZE : 0);
+        queue_map_size * 4;
     /* +sizeof(u32)+sizeof(ijon_fastresume_state_t) only in IJON mode */
     m_len = ((queue_map_size + 7) >> 3);
 
@@ -3432,12 +3311,6 @@ int main(int argc, char **argv_orig, char **envp) {
 
     OKF("Successfully loaded fastresume.bin (%u bytes)!", r);
     ZLIBCLOSE(fr_fd);
-    if (unlikely(vp_fastresume_buf)) {
-
-      ck_free(vp_fastresume_buf);
-      vp_fastresume_buf = NULL;
-
-    }
 
     afl->reinit_table = 1;
     update_calibration_time(afl, &resume_start);
@@ -4161,13 +4034,11 @@ stop_fuzzing:
       u8   ver_string[8];
       u32  w = 0;
       u64 *ver = (u64 *)ver_string;
-      u8   save_vp_state = afl->virgin_val_prof ? 1 : 0;
       /* Include IJON state size in version only when IJON is used */
       *ver = FAST_RESUME_VERSION + afl->shm.cmplog_mode +
              (sizeof(struct queue_entry) << 1) +
              (afl->fsrv.use_ijon ? sizeof(u32) + sizeof(ijon_fastresume_state_t)
-                                 : 0) +
-             (save_vp_state ? VALUE_PROFILE_MAP_SIZE : 0);
+                                 : 0);
 
       ZLIBWRITE(fr_fd, ver_string, sizeof(ver_string), "ver_string");
 
@@ -4215,16 +4086,8 @@ stop_fuzzing:
 
       }
 
-      if (likely(save_vp_state)) {
-
-        ZLIBWRITE(fr_fd, afl->virgin_val_prof, VALUE_PROFILE_MAP_SIZE,
-                  "virgin_val_prof");
-
-      }
-
       w += sizeof(ver_string) + (afl->fsrv.use_ijon ? sizeof(u32) : 0) +
-           afl->fsrv.map_size * 4 +
-           (save_vp_state ? VALUE_PROFILE_MAP_SIZE : 0);
+           afl->fsrv.map_size * 4;
 
       u8                  on[1] = {1}, off[1] = {0};
       u8                 *o_start = (u8 *)&(afl->queue_buf[0]->colorized);

@@ -733,8 +733,7 @@ typedef struct afl_state {
 
   u8 *virgin_bits,                      /* Regions yet untouched by fuzzing */
       *virgin_tmout,                    /* Bits we haven't seen in tmouts   */
-      *virgin_crash,                    /* Bits we haven't seen in crashes  */
-      *virgin_val_prof;                 /* Value profile virgin bitmap      */
+      *virgin_crash;                    /* Bits we haven't seen in crashes  */
 
   double *alias_probability;            /* alias weighted probabilities     */
   u32    *alias_table;                /* alias weighted random lookup table */
@@ -890,8 +889,6 @@ typedef struct afl_state {
 
   /* Value profiling */
   u8  value_profile_mode;              /* 0=off, 1=always, 2=stagnation     */
-  u8  value_profile_level;             /* 1=greedy frontier, 2=feature-rich */
-  u8  value_profile_source;            /* resolved runtime data source      */
   u32 value_profile_slots;             /* Per-site frontier width (K)       */
   u32 value_profile_stagnation_secs;   /* Stagnation threshold (seconds)    */
   u8  value_profile_active;            /* Currently active?                 */
@@ -907,9 +904,6 @@ typedef struct afl_state {
 
 /* Max real VP distance is 256; 257 means no candidate for this site. */
 #define VP_DIST_UNSOLVED 257U
-#define VP_LEVEL_DEFAULT 1U
-#define VP_LEVEL_MIN 1U
-#define VP_LEVEL_MAX 2U
 #define VP_SLOTS_DEFAULT VP_DEFAULT_SLOTS
 #define VP_SLOTS_MIN 1U
 #define VP_SLOTS_MAX VP_MAX_SLOTS
@@ -918,14 +912,6 @@ typedef struct afl_state {
 #define VP_TAINT_MIN_RANGE 8U
 #define VP_TAINT_BIAS 80U             /* % chance to pick VP-sensitive byte */
 #define AFL_VP_TAINT_TIMEOUT_MS (10 * 60 * 1000U)
-#define VP_SOURCE_NONE 0U
-#define VP_SOURCE_RUNTIME_SHM 1U
-#define VP_SOURCE_CMPLOG_INLINE 2U
-#define VP_SOURCE_CMPLOG_CHILD 3U
-#define VP_TRIGGER_BITMAP_WORDS (CMP_MAP_W / 64)
-  /* Store trigger bits as native words to avoid casting between
-     different pointer types in the hot-path scanner. */
-  u64 vp_trigger_bitmap[VP_TRIGGER_BITMAP_WORDS];
 
   struct afl_pass_stat *pass_stats;
   struct cmp_map       *orig_cmp_map;
@@ -1423,7 +1409,6 @@ void afl_dump_module_map(afl_state_t *);
 
 /* Value profiling (afl-fuzz-valprof.c) */
 
-u32  vp_check_cmpmap(afl_state_t *);
 void vp_update_activation(afl_state_t *);
 void vp_frontier_apply(afl_state_t *, struct queue_entry *);
 void vp_frontier_apply_with_cost(afl_state_t *, struct queue_entry *, u64);
@@ -1437,8 +1422,6 @@ void vp_trim_guard_destroy(vp_trim_guard_t *);
 void vp_trim_refresh_owner_cost(afl_state_t *, struct queue_entry *);
 void vp_apply_delayed_evictions(afl_state_t *);
 u8   vp_collect_signal_for_input(afl_state_t *, u8 *, u32);
-u8   vp_run_cmplog(afl_state_t *, void *, u32);
-u8   vp_ensure_cmp_data_ready(afl_state_t *, void *, u32);
 void vp_prepare_exec(afl_state_t *, afl_forkserver_t *);
 void vp_runtime_set_site_filter(afl_state_t *, const u16 *, u32);
 void vp_runtime_clear_site_filter(afl_state_t *);

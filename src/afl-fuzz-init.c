@@ -942,8 +942,7 @@ void perform_dry_run(afl_state_t *afl) {
 
     close(fd);
 
-    if (unlikely(afl->value_profile_active && afl->value_profile_level == 1 &&
-                 afl->value_profile_source == VP_SOURCE_RUNTIME_SHM)) {
+    if (unlikely(afl->value_profile_active)) {
 
       /* Keep runtime VP state stable while calibration re-runs this seed. */
       vp_prev_active = afl->value_profile_active;
@@ -981,9 +980,7 @@ void perform_dry_run(afl_state_t *afl) {
 
       u8 vp_ready = 0;
 
-      if (afl->value_profile_level == 1 &&
-          afl->value_profile_source == VP_SOURCE_RUNTIME_SHM &&
-          vp_runtime_refresh) {
+      if (vp_runtime_refresh) {
 
         /* Dry-run L1/runtime: collect one post-calibration VP sample. */
         void *exec_mem = use_mem;
@@ -1001,19 +998,9 @@ void perform_dry_run(afl_state_t *afl) {
 
         }
 
-      } else {
-
-        vp_ready = vp_ensure_cmp_data_ready(afl, use_mem, read_len);
-
       }
 
-      if (vp_ready) {
-
-        if (afl->value_profile_level == 2) { vp_check_cmpmap(afl); }
-
-        vp_frontier_apply(afl, q);
-
-      }
+      if (vp_ready) { vp_frontier_apply(afl, q); }
 
     }
 
@@ -1954,6 +1941,10 @@ void nuke_resume_dir(afl_state_t *afl) {
   ck_free(fn);
 
   fn = alloc_printf("%s/_resume/.state/variable_behavior", afl->out_dir);
+  if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
+  ck_free(fn);
+
+  fn = alloc_printf("%s/_resume/.state/vp_taint", afl->out_dir);
   if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
   ck_free(fn);
 

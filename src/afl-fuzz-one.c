@@ -459,9 +459,7 @@ static inline void vp_taint_note_refresh_complete(struct queue_entry *q) {
 static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
                                    u8 splice_cycle) {
 
-  if (!afl || !q || splice_cycle || afl->value_profile_level != 1 ||
-      !q->vp_ref_cnt)
-    return;
+  if (!afl || !q || splice_cycle || !q->vp_ref_cnt) return;
 
   vp_taint_tick_refresh_cooldown(q);
 
@@ -919,9 +917,7 @@ u8 fuzz_one_original(afl_state_t *afl) {
 
   }
 
-  /* cmplog_binary guards child-forkserver use; shm.cmplog_mode can be set by
-     VP inline mode without a CmpLog child process. */
-  if (unlikely(afl->cmplog_binary &&
+  if (unlikely(afl->shm.cmplog_mode &&
                afl->queue_cur->colorized < afl->cmplog_lvl &&
                (u32)len <= afl->cmplog_max_filesize)) {
 
@@ -962,8 +958,8 @@ u8 fuzz_one_original(afl_state_t *afl) {
   u8 *skip_eff_map = afl->queue_cur->skipdet_e->skip_eff_map;
   u8  vp_det_use_vp_map = 0;
   u8  vp_det_candidate =
-      (u8)(afl->value_profile_level == 1 && afl->queue_cur->favored &&
-           afl->queue_cur->vp_only && afl->queue_cur->vp_ref_cnt > 0);
+      (u8)(afl->queue_cur->favored && afl->queue_cur->vp_only &&
+           afl->queue_cur->vp_ref_cnt > 0);
 
   if (vp_det_candidate) {
 
@@ -4267,9 +4263,7 @@ static u8 mopt_common_fuzzing(afl_state_t *afl, MOpt_globals_t MOpt_globals) {
 
   }
 
-  /* Use cmplog_binary, not shm.cmplog_mode: VP inline mode may still allocate
-     cmp_map SHM while no CmpLog child forkserver exists. */
-  if (unlikely(afl->cmplog_binary &&
+  if (unlikely(afl->shm.cmplog_mode &&
                afl->queue_cur->colorized < afl->cmplog_lvl &&
                (u32)len <= afl->cmplog_max_filesize)) {
 

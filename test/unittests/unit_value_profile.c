@@ -23,20 +23,6 @@ extern void mock_assert(const int result, const char *const expression,
 #include "afl-fuzz.h"
 #include "value-profile.h"
 
-typedef struct {
-
-  afl_state_t *afl;
-  u32          site;
-  u8           shape;
-  u64          v0;
-  u64          v1;
-  u8           enabled;
-  u8           result;
-
-} cmplog_stub_cfg_t;
-
-static cmplog_stub_cfg_t cmplog_stub_cfg;
-
 /* Stubs for functions referenced by afl-fuzz-valprof.o. */
 u32 write_to_testcase(afl_state_t *afl, void **mem, u32 len, u32 fix) {
 
@@ -51,20 +37,9 @@ u32 write_to_testcase(afl_state_t *afl, void **mem, u32 len, u32 fix) {
 fsrv_run_result_t fuzz_run_target(afl_state_t *afl, afl_forkserver_t *fsrv,
                                   u32 timeout) {
 
+  (void)afl;
+  (void)fsrv;
   (void)timeout;
-
-  if (cmplog_stub_cfg.enabled && cmplog_stub_cfg.afl == afl &&
-      fsrv == &afl->cmplog_fsrv && afl->shm.cmp_map) {
-
-    struct cmp_map *cmp = afl->shm.cmp_map;
-    cmp->headers[cmplog_stub_cfg.site].hits = 1;
-    cmp->headers[cmplog_stub_cfg.site].type = CMP_TYPE_INS;
-    cmp->headers[cmplog_stub_cfg.site].shape = cmplog_stub_cfg.shape;
-    cmp->log[cmplog_stub_cfg.site][0].v0 = cmplog_stub_cfg.v0;
-    cmp->log[cmplog_stub_cfg.site][0].v1 = cmplog_stub_cfg.v1;
-    return (fsrv_run_result_t)cmplog_stub_cfg.result;
-
-  }
 
   return FSRV_RUN_OK;
 
@@ -169,9 +144,8 @@ static void free_vp_frontier(afl_state_t *afl);
 
 static inline size_t vp_test_slot_replicas(afl_state_t *afl) {
 
-  return afl->value_profile_source == VP_SOURCE_RUNTIME_SHM
-             ? VP_RUNTIME_SLOT_REPLICA_LIMIT
-             : 1U;
+  (void)afl;
+  return VP_RUNTIME_SLOT_REPLICA_LIMIT;
 
 }
 
@@ -191,144 +165,9 @@ static inline size_t vp_test_runtime_frontier_idx(afl_state_t *afl, u32 site,
 
 }
 
-static void test_wide_ins_compare_keeps_vp_site_active(void **state) {
-
-  (void)state;
-
-  afl_state_t         afl;
-  struct cmp_map     *cmp;
-  struct queue_entry  old_q, new_q;
-  struct queue_entry *vp_saved;
-
-  memset(&afl, 0, sizeof(afl));
-  memset(&old_q, 0, sizeof(old_q));
-  memset(&new_q, 0, sizeof(new_q));
-
-  cmp = calloc(1, sizeof(struct cmp_map));
-  assert_non_null(cmp);
-  afl.shm.cmp_map = cmp;
-  afl.value_profile_level = 2;
-  afl.value_profile_source = VP_SOURCE_CMPLOG_INLINE;
-
-  setup_vp_frontier(&afl, 1);
-
-  old_q.exec_us = 100;
-  old_q.len = 100;
-  old_q.vp_ref_cnt = 1;
-  new_q.exec_us = 1;
-  new_q.len = 1;
-
-  /* 16-byte compare with identical low half and differing high half. */
-  cmp->headers[0].hits = 1;
-  cmp->headers[0].type = CMP_TYPE_INS;
-  cmp->headers[0].shape = 15;                                   /* 16 bytes */
-  cmp->log[0][0].v0 = 0x1122334455667788ULL;
-  cmp->log[0][0].v1 = 0x1122334455667788ULL;
-  cmp->log[0][0].v0_128 = 0x1ULL;
-  cmp->log[0][0].v1_128 = 0x2ULL;
-  afl.vp_trigger_bitmap[0] = 1;
-
-  afl.vp_frontier[0].owner = &old_q;
-  afl.vp_frontier[0].dist = 10;
-  afl.vp_frontier[0].tag = 0;
-  afl.vp_frontier[0].cost = 10000;
-  afl.top_rated_vp[0] = &old_q;
-  afl.top_rated_vp_dist[0] = 10;
-
-  vp_frontier_apply(&afl, &new_q);
-
-  vp_saved = afl.top_rated_vp[0];
-  assert_ptr_equal(vp_saved, &new_q);
-  assert_int_equal(old_q.vp_ref_cnt, 0);
-  assert_true(new_q.vp_ref_cnt > 0);
-  assert_true(afl.top_rated_vp_dist[0] < 65);
-  assert_true(afl.top_rated_vp_dist[0] != 0xffffffff);
-
-  free_vp_frontier(&afl);
-  free(cmp);
-
-}
-
-static void test_solved_wide_ins_compare_does_not_consume_vp_bits(
-    void **state) {
-
-  (void)state;
-
-  afl_state_t     afl;
-  struct cmp_map *cmp;
-  u8             *virgin;
-  u32             bits;
-
-  memset(&afl, 0, sizeof(afl));
-
-  cmp = calloc(1, sizeof(struct cmp_map));
-  assert_non_null(cmp);
-  virgin = calloc(1, VALUE_PROFILE_MAP_SIZE);
-  assert_non_null(virgin);
-  memset(virgin, 0xff, VALUE_PROFILE_MAP_SIZE);
-
-  afl.shm.cmp_map = cmp;
-  afl.virgin_val_prof = virgin;
-
-  cmp->headers[0].hits = 1;
-  cmp->headers[0].type = CMP_TYPE_INS;
-  cmp->headers[0].shape = 15;                                   /* 16 bytes */
-  cmp->log[0][0].v0 = 0x1122334455667788ULL;
-  cmp->log[0][0].v1 = 0x1122334455667788ULL;
-  cmp->log[0][0].v0_128 = 0x99aabbccddeeff00ULL;
-  cmp->log[0][0].v1_128 = 0x99aabbccddeeff00ULL;
-
-  bits = vp_check_cmpmap(&afl);
-  assert_int_equal(bits, 0);
-
-  free(virgin);
-  free(cmp);
-
-}
-
-static void test_solved_rtn_compare_does_not_consume_vp_bits(void **state) {
-
-  (void)state;
-
-  afl_state_t            afl;
-  struct cmp_map        *cmp;
-  struct cmpfn_operands *rtn;
-  u8                    *virgin;
-  u32                    bits;
-
-  memset(&afl, 0, sizeof(afl));
-
-  cmp = calloc(1, sizeof(struct cmp_map));
-  assert_non_null(cmp);
-  virgin = calloc(1, VALUE_PROFILE_MAP_SIZE);
-  assert_non_null(virgin);
-  memset(virgin, 0xff, VALUE_PROFILE_MAP_SIZE);
-
-  afl.shm.cmp_map = cmp;
-  afl.virgin_val_prof = virgin;
-
-  cmp->headers[0].hits = 1;
-  cmp->headers[0].type = CMP_TYPE_RTN;
-  rtn = (struct cmpfn_operands *)cmp->log[0];
-
-  /* String-like compare with equal content must not consume VP bits. */
-  rtn[0].v0_len = 0x80 + 5;
-  rtn[0].v1_len = 0x80 + 5;
-  memcpy(rtn[0].v0, "AAAA", 5);
-  memcpy(rtn[0].v1, "AAAA", 5);
-
-  bits = vp_check_cmpmap(&afl);
-  assert_int_equal(bits, 0);
-
-  free(virgin);
-  free(cmp);
-
-}
-
 static void setup_vp_frontier(afl_state_t *afl, u32 slots) {
 
   size_t n = (size_t)CMP_MAP_W * slots * vp_test_slot_replicas(afl);
-  afl->value_profile_level = 1;
   afl->value_profile_slots = slots;
   afl->top_rated_vp = calloc(CMP_MAP_W, sizeof(struct queue_entry *));
   assert_non_null(afl->top_rated_vp);
@@ -374,8 +213,6 @@ static void test_runtime_frontier_update_with_overflow_scan(void **state) {
 
   vp = calloc(1, sizeof(vp_map_t));
   assert_non_null(vp);
-
-  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
   afl.value_profile_mode = 1;
   afl.value_profile_active = 1;
   afl.queue_cycle = 1;
@@ -420,8 +257,6 @@ static void test_runtime_frontier_keeps_separate_metric_tags(void **state) {
 
   vp = calloc(1, sizeof(vp_map_t));
   assert_non_null(vp);
-
-  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
   afl.value_profile_mode = 1;
   afl.value_profile_active = 1;
   afl.queue_cycle = 1;
@@ -483,8 +318,6 @@ static void test_runtime_frontier_keeps_best_replicas_per_slot(void **state) {
 
   vp = calloc(1, sizeof(vp_map_t));
   assert_non_null(vp);
-
-  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
   afl.value_profile_mode = 1;
   afl.value_profile_active = 1;
   afl.queue_cycle = 1;
@@ -556,8 +389,6 @@ static void test_runtime_frontier_keeps_three_scalar_hit_pairs(void **state) {
 
   vp = calloc(1, sizeof(vp_map_t));
   assert_non_null(vp);
-
-  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
   afl.value_profile_mode = 1;
   afl.value_profile_active = 1;
   afl.queue_cycle = 1;
@@ -623,7 +454,6 @@ static void test_l1_favoring_marks_best_entry_per_runtime_slot(void **state) {
   afl.smallest_favored = -1;
   afl.value_profile_mode = 1;
   afl.value_profile_active = 1;
-  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
   setup_vp_frontier(&afl, 4);
 
   q_best0.id = 10;
@@ -680,7 +510,6 @@ static void test_l1_favoring_uses_runtime_slot_mask(void **state) {
   afl.smallest_favored = -1;
   afl.value_profile_mode = 1;
   afl.value_profile_active = 1;
-  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
   setup_vp_frontier(&afl, 4);
   afl.vp_runtime_slot_mask = calloc(CMP_MAP_W, sizeof(u16));
   assert_non_null(afl.vp_runtime_slot_mask);
@@ -733,7 +562,6 @@ static void test_l1_runtime_slot_mask_clears_stale_external_disable(
   afl.smallest_favored = -1;
   afl.value_profile_mode = 1;
   afl.value_profile_active = 1;
-  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
   setup_vp_frontier(&afl, 4);
   afl.vp_runtime_slot_mask = calloc(CMP_MAP_W, sizeof(u16));
   assert_non_null(afl.vp_runtime_slot_mask);
@@ -781,8 +609,6 @@ static void test_runtime_frontier_retains_protected_same_tag_on_equal_dist(
 
   vp = calloc(1, sizeof(vp_map_t));
   assert_non_null(vp);
-
-  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
   afl.value_profile_mode = 1;
   afl.value_profile_active = 1;
   afl.queue_cycle = 1;
@@ -846,7 +672,6 @@ static void test_runtime_trim_guard_preserve_and_regress(void **state) {
 
   afl.value_profile_mode = 1;
   afl.value_profile_active = 1;
-  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
   afl.shm.vp_map = vp;
   setup_vp_frontier(&afl, 1);
 
@@ -998,7 +823,6 @@ static void test_runtime_trim_guard_distinguishes_runtime_slots(void **state) {
 
   afl.value_profile_mode = 1;
   afl.value_profile_active = 1;
-  afl.value_profile_source = VP_SOURCE_RUNTIME_SHM;
   afl.shm.vp_map = vp;
   setup_vp_frontier(&afl, 2);
 
@@ -1046,142 +870,27 @@ static void test_runtime_trim_guard_distinguishes_runtime_slots(void **state) {
 
 }
 
-static void test_cmplog_inline_trim_guard_preserve_and_regress(void **state) {
-
-  (void)state;
-
-  afl_state_t        afl;
-  struct queue_entry q;
-  struct cmp_map    *cmp;
-  vp_trim_guard_t   *guard;
-  u32                site = 19;
-  size_t             idx;
-
-  memset(&afl, 0, sizeof(afl));
-  memset(&q, 0, sizeof(q));
-  cmp = calloc(1, sizeof(struct cmp_map));
-  assert_non_null(cmp);
-
-  afl.value_profile_mode = 1;
-  afl.value_profile_active = 1;
-  afl.value_profile_source = VP_SOURCE_CMPLOG_INLINE;
-  afl.shm.cmp_map = cmp;
-  setup_vp_frontier(&afl, 1);
-
-  q.vp_ref_cnt = 1;
-  idx = vp_test_frontier_idx(&afl, site, 0);
-  afl.vp_frontier[idx].owner = &q;
-  afl.vp_frontier[idx].dist = 3;
-  afl.vp_frontier[idx].tag = 0;
-  afl.vp_frontier[idx].cost = 100;
-
-  guard = vp_trim_guard_init(&afl, &q);
-  assert_non_null(guard);
-
-  cmp->headers[site].hits = 1;
-  cmp->headers[site].type = CMP_TYPE_INS;
-  cmp->headers[site].shape = 0;
-  cmp->log[site][0].v0 = 0x1;
-  cmp->log[site][0].v1 = 0x2;
-  assert_true(vp_trim_guard_preserved(guard, NULL, 0, 0, 0));
-
-  cmp->headers[site].hits = 1;
-  cmp->headers[site].type = CMP_TYPE_INS;
-  cmp->headers[site].shape = 0;
-  cmp->log[site][0].v0 = 0x0;
-  cmp->log[site][0].v1 = 0xf0;
-  assert_false(vp_trim_guard_preserved(guard, NULL, 0, 0, 0));
-
-  vp_trim_guard_destroy(guard);
-  free_vp_frontier(&afl);
-  free(cmp);
-
-}
-
-static void test_cmplog_child_trim_guard_preserve_and_regress(void **state) {
-
-  (void)state;
-
-  afl_state_t        afl;
-  struct queue_entry q;
-  struct cmp_map    *cmp;
-  vp_trim_guard_t   *guard;
-  u32                site = 13;
-  size_t             idx;
-  u8                 in_buf[6] = {1, 2, 3, 4, 5, 6};
-
-  memset(&afl, 0, sizeof(afl));
-  memset(&q, 0, sizeof(q));
-  memset(&cmplog_stub_cfg, 0, sizeof(cmplog_stub_cfg));
-  cmp = calloc(1, sizeof(struct cmp_map));
-  assert_non_null(cmp);
-
-  afl.value_profile_mode = 1;
-  afl.value_profile_active = 1;
-  afl.value_profile_source = VP_SOURCE_CMPLOG_CHILD;
-  afl.shm.cmp_map = cmp;
-  afl.cmplog_binary = (u8 *)"dummy-cmplog";
-  afl.cmplog_max_filesize = 4096;
-  afl.fsrv.map_size = 1;
-  afl.fsrv.trace_bits = calloc(1, 1);
-  afl.map_tmp_buf = calloc(1, 1);
-  assert_non_null(afl.fsrv.trace_bits);
-  assert_non_null(afl.map_tmp_buf);
-  setup_vp_frontier(&afl, 1);
-
-  q.vp_ref_cnt = 1;
-  idx = vp_test_frontier_idx(&afl, site, 0);
-  afl.vp_frontier[idx].owner = &q;
-  afl.vp_frontier[idx].dist = 2;
-  afl.vp_frontier[idx].tag = 0;
-  afl.vp_frontier[idx].cost = 100;
-
-  guard = vp_trim_guard_init(&afl, &q);
-  assert_non_null(guard);
-
-  cmplog_stub_cfg.enabled = 1;
-  cmplog_stub_cfg.afl = &afl;
-  cmplog_stub_cfg.site = site;
-  cmplog_stub_cfg.shape = 0;
-  cmplog_stub_cfg.v0 = 0x1;
-  cmplog_stub_cfg.v1 = 0x2;
-  cmplog_stub_cfg.result = FSRV_RUN_OK;
-  assert_true(vp_trim_guard_preserved(guard, in_buf, sizeof(in_buf), 1, 1));
-
-  cmplog_stub_cfg.v0 = 0x0;
-  cmplog_stub_cfg.v1 = 0xf0;
-  assert_false(vp_trim_guard_preserved(guard, in_buf, sizeof(in_buf), 1, 1));
-
-  cmplog_stub_cfg.enabled = 0;
-  vp_trim_guard_destroy(guard);
-  free_vp_frontier(&afl);
-  free(afl.fsrv.trace_bits);
-  free(afl.map_tmp_buf);
-  free(cmp);
-
-}
-
 static void test_trim_deferred_cleared_on_last_ref_drop(void **state) {
 
   (void)state;
 
   afl_state_t         afl;
-  struct cmp_map     *cmp;
   struct queue_entry  old_q, new_q;
+  vp_map_t           *vp;
   u32                 site = 3;
-  size_t              idx;
+  size_t              idx[VP_RUNTIME_SLOT_REPLICA_LIMIT];
+  struct queue_entry  replacements[VP_RUNTIME_SLOT_REPLICA_LIMIT];
 
   memset(&afl, 0, sizeof(afl));
   memset(&old_q, 0, sizeof(old_q));
   memset(&new_q, 0, sizeof(new_q));
-  cmp = calloc(1, sizeof(struct cmp_map));
-  assert_non_null(cmp);
+  vp = calloc(1, sizeof(vp_map_t));
+  assert_non_null(vp);
 
-  afl.value_profile_level = 2;
-  afl.value_profile_source = VP_SOURCE_CMPLOG_INLINE;
+  afl.value_profile_mode = 1;
+  afl.value_profile_active = 1;
   afl.queue_cycle = 5;
-  afl.shm.cmp_map = cmp;
-  afl.vp_trigger_bitmap[site >> 6] = 1ULL << (site & 63);
+  afl.shm.vp_map = vp;
   setup_vp_frontier(&afl, 1);
 
   old_q.vp_ref_cnt = 1;
@@ -1190,33 +899,63 @@ static void test_trim_deferred_cleared_on_last_ref_drop(void **state) {
   old_q.exec_us = 10;
   old_q.len = 100;
 
-  new_q.exec_us = 1;
-  new_q.len = 8;
+  memset(replacements, 0, sizeof(replacements));
+  for (u32 i = 0; i < VP_RUNTIME_SLOT_REPLICA_LIMIT; ++i) {
 
-  idx = vp_test_frontier_idx(&afl, site, 0);
-  afl.vp_frontier[idx].owner = &old_q;
-  afl.vp_frontier[idx].dist = 10;
-  afl.vp_frontier[idx].tag = 0;
-  afl.vp_frontier[idx].cost = 1000;
+    replacements[i].exec_us = 1;
+    replacements[i].len = 8 + i;
+
+  }
+  for (u32 i = 0; i < VP_RUNTIME_SLOT_REPLICA_LIMIT; ++i) {
+
+    idx[i] = vp_test_runtime_frontier_idx(&afl, site, 0, i);
+    afl.vp_frontier[idx[i]].owner = &old_q;
+    afl.vp_frontier[idx[i]].dist = 10;
+    afl.vp_frontier[idx[i]].tag = 0;
+    afl.vp_frontier[idx[i]].cost = 1000 + i;
+
+  }
+
+  old_q.vp_ref_cnt = VP_RUNTIME_SLOT_REPLICA_LIMIT;
   afl.top_rated_vp[site] = &old_q;
   afl.top_rated_vp_dist[site] = 10;
 
-  cmp->headers[site].hits = 1;
-  cmp->headers[site].type = CMP_TYPE_INS;
-  cmp->headers[site].shape = 0;
-  cmp->log[site][0].v0 = 0x1;
-  cmp->log[site][0].v1 = 0x2;
+  vp->enabled = 1;
+  vp->control_len = 1;
+  vp->control[0] = site;
+  vp->site[site].valid_mask = 1U;
+  vp->site[site].touched_mask = 1U;
+  vp->site[site].slots[0].best_dist = 1U;
+  vp->site[site].slots[0].slot_key = 0U;
 
-  vp_frontier_apply(&afl, &new_q);
+  for (u32 i = 0; i < VP_RUNTIME_SLOT_REPLICA_LIMIT; ++i) {
+
+    vp_frontier_apply(&afl, &replacements[i]);
+
+  }
 
   assert_int_equal(old_q.vp_ref_cnt, 0);
   assert_int_equal(old_q.vp_trim_deferred, 0);
   assert_int_equal(old_q.trim_done, 0);
-  assert_true(new_q.vp_ref_cnt > 0);
-  assert_ptr_equal(afl.top_rated_vp[site], &new_q);
+
+  u32 replacement_refs = 0;
+  u8  top_rated_is_replacement = 0;
+  for (u32 i = 0; i < VP_RUNTIME_SLOT_REPLICA_LIMIT; ++i) {
+
+    replacement_refs += replacements[i].vp_ref_cnt;
+    if (afl.top_rated_vp[site] == &replacements[i]) {
+
+      top_rated_is_replacement = 1;
+
+    }
+
+  }
+
+  assert_int_equal(replacement_refs, VP_RUNTIME_SLOT_REPLICA_LIMIT);
+  assert_true(top_rated_is_replacement);
 
   free_vp_frontier(&afl);
-  free(cmp);
+  free(vp);
 
 }
 
@@ -1229,9 +968,6 @@ int main(int argc, char **argv) {
 
       cmocka_unit_test(test_mode2_activation_and_deactivation),
       cmocka_unit_test(test_non_stagnation_mode_is_noop),
-      cmocka_unit_test(test_wide_ins_compare_keeps_vp_site_active),
-      cmocka_unit_test(test_solved_wide_ins_compare_does_not_consume_vp_bits),
-      cmocka_unit_test(test_solved_rtn_compare_does_not_consume_vp_bits),
       cmocka_unit_test(test_runtime_frontier_update_with_overflow_scan),
       cmocka_unit_test(test_runtime_frontier_keeps_separate_metric_tags),
       cmocka_unit_test(test_runtime_frontier_keeps_best_replicas_per_slot),
@@ -1245,8 +981,6 @@ int main(int argc, char **argv) {
       cmocka_unit_test(test_runtime_observe_helper_resets_and_restores_sites),
       cmocka_unit_test(test_runtime_trim_guard_preserve_and_regress),
       cmocka_unit_test(test_runtime_trim_guard_distinguishes_runtime_slots),
-      cmocka_unit_test(test_cmplog_inline_trim_guard_preserve_and_regress),
-      cmocka_unit_test(test_cmplog_child_trim_guard_preserve_and_regress),
       cmocka_unit_test(test_trim_deferred_cleared_on_last_ref_drop)};
 
   __real_exit(cmocka_run_group_tests(tests, NULL, NULL));

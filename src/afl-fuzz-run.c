@@ -1260,7 +1260,6 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
         u8 *custom_buf = queue_testcase_get(afl, q);
         if (vp_collect_signal_for_input(afl, custom_buf, q->len)) {
 
-          if (afl->value_profile_level == 2) { (void)vp_check_cmpmap(afl); }
           vp_frontier_apply(afl, q);
 
         }
@@ -1528,7 +1527,6 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
 
       if (vp_collect_signal_for_input(afl, in_buf, q->len)) {
 
-        if (afl->value_profile_level == 2) { (void)vp_check_cmpmap(afl); }
         vp_frontier_apply(afl, q);
 
       }
