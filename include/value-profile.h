@@ -51,11 +51,13 @@ typedef struct {
 
 typedef struct {
 
-  u64 exec_id;                 /* Monotonic execution epoch                   */
-  u8  enabled;                 /* Runtime collection enabled for this exec    */
-  u8  reserved_flags[3];       /* Reserved for alignment / future flags       */
-  u32 control_len;             /* Number of valid site ids in control[]      */
-  u32 control_drops;           /* Dropped appends when control[] is full     */
+  u64 exec_id;               /* Monotonic execution epoch                   */
+  u8  enabled;               /* Runtime collection enabled for this exec    */
+  u8  filter_enabled;        /* Restrict recording to filter_bitmap sites   */
+  u8  reserved_flags[2];     /* Reserved for alignment / future flags       */
+  u32 control_len;            /* Number of valid site ids in control[]      */
+  u32 control_drops;          /* Dropped appends when control[] is full     */
+  u64 filter_bitmap[VP_MAP_W / 64U]; /* Optional per-exec site allowlist      */
   u16 control[VP_CONTROL_CAP]; /* Site ids with at least one slot update     */
   vp_site_t site[VP_MAP_W];    /* Per-site persistent top-K slot state       */
 

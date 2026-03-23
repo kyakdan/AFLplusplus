@@ -329,17 +329,23 @@ struct queue_entry {
   u8                    vp_taint_needs_refresh;  /* ownership drift hint     */
   u16                   vp_taint_refresh_streak; /* persistent mismatch cnt  */
   u16                   vp_taint_refresh_cooldown; /* refresh backoff visits */
-  struct vp_taint_site *vp_taint;       /* per-site taint masks (list)      */
+  u32                   vp_taint_owner_generation; /* owned-site snapshot gen */
+  struct vp_taint_site *vp_taint;       /* per-site taint masks (array)     */
+  u32                   vp_taint_cnt;        /* # per-site taint entries    */
+  u16                  *vp_taint_analyzed_sites; /* all analyzed VP sites    */
+  u32                   vp_taint_analyzed_cnt;   /* # analyzed VP sites      */
+  u16                  *vp_owned_sites;      /* current owned VP sites      */
+  u32                   vp_owned_site_cnt;   /* # current owned VP sites    */
+  u32                   vp_owned_site_cap;   /* owned-site array capacity   */
   vp_taint_resume_t    *vp_taint_resume;
 
 };
 
 typedef struct vp_taint_site {
 
-  u16                   site_id;              /* VP site index              */
-  u32                   sensitive_cnt;        /* # of VP-sensitive bytes    */
-  u32                  *sensitive_positions;  /* byte offset array          */
-  struct vp_taint_site *next;
+  u16  site_id;                               /* VP site index              */
+  u32  sensitive_cnt;                         /* # of VP-sensitive bytes    */
+  u32 *sensitive_positions;                   /* byte offset array          */
 
 } vp_taint_site_t;
 
@@ -1424,6 +1430,8 @@ u8   vp_collect_signal_for_input(afl_state_t *, u8 *, u32);
 u8   vp_run_cmplog(afl_state_t *, void *, u32);
 u8   vp_ensure_cmp_data_ready(afl_state_t *, void *, u32);
 void vp_prepare_exec(afl_state_t *, afl_forkserver_t *);
+void vp_runtime_set_site_filter(afl_state_t *, const u16 *, u32);
+void vp_runtime_clear_site_filter(afl_state_t *);
 
 /* VP taint analysis (afl-fuzz-vp-taint.c) */
 

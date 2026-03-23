@@ -2869,6 +2869,13 @@ static inline void vp_runtime_append_control(vp_map_t *vp, u16 site_id) {
 /* Prepare per-exec state for one VP site and return its persistent entry. */
 static inline vp_site_t *vp_runtime_prepare_site(vp_map_t *vp, u16 site_id) {
 
+  if (vp->filter_enabled &&
+      !(vp->filter_bitmap[site_id >> 6] & (1ULL << (site_id & 63)))) {
+
+    return NULL;
+
+  }
+
   vp_site_t *site = &vp->site[site_id];
   if (site->exec_seen != vp->exec_id) {
 
@@ -3032,7 +3039,8 @@ static inline void vp_runtime_record_dist(u16 site_id, u16 dist) {
 
   u16        slot_count = __afl_vp_slots;
   vp_site_t *site = vp_runtime_prepare_site(vp, site_id);
-  u16        hit_ordinal = site->hit_count;
+  if (unlikely(!site)) return;
+  u16 hit_ordinal = site->hit_count;
   if (site->hit_count < 0xffffU) { ++site->hit_count; }
 
   u16 preferred_start_slot =
@@ -3053,7 +3061,8 @@ static inline void vp_runtime_record_scalar_dists(u16 site_id, u16 hamming_dist,
 
   u16        slot_count = __afl_vp_slots;
   vp_site_t *site = vp_runtime_prepare_site(vp, site_id);
-  u16        hit_ordinal = site->hit_count;
+  if (unlikely(!site)) return;
+  u16 hit_ordinal = site->hit_count;
   if (site->hit_count < 0xffffU) { ++site->hit_count; }
 
   u16 preferred_start_slot =
@@ -3298,7 +3307,8 @@ static inline void vp_runtime_record_rtn(u8 *ptr1, u8 *ptr2, u32 max_len,
      for INS compares. */
   u16        slot_count = __afl_vp_slots;
   vp_site_t *s = vp_runtime_prepare_site(vp, site);
-  u16        hit_ordinal = s->hit_count;
+  if (unlikely(!s)) return;
+  u16 hit_ordinal = s->hit_count;
   if (s->hit_count < 0xffffU) { ++s->hit_count; }
 
   u16 preferred_start_slot =

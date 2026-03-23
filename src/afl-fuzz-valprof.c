@@ -303,6 +303,34 @@ void vp_prepare_exec(afl_state_t *afl, afl_forkserver_t *fsrv) {
 
 }
 
+void vp_runtime_set_site_filter(afl_state_t *afl, const u16 *site_ids,
+                                u32 site_cnt) {
+
+  vp_map_t *vp = afl ? afl->shm.vp_map : NULL;
+  if (unlikely(!vp)) return;
+
+  memset(vp->filter_bitmap, 0, sizeof(vp->filter_bitmap));
+  for (u32 i = 0; i < site_cnt; ++i) {
+
+    u16 site_id = site_ids[i];
+    vp->filter_bitmap[site_id >> 6] |= (1ULL << (site_id & 63));
+
+  }
+
+  vp->filter_enabled = site_cnt ? 1U : 0U;
+
+}
+
+void vp_runtime_clear_site_filter(afl_state_t *afl) {
+
+  vp_map_t *vp = afl ? afl->shm.vp_map : NULL;
+  if (unlikely(!vp)) return;
+
+  vp->filter_enabled = 0;
+  memset(vp->filter_bitmap, 0, sizeof(vp->filter_bitmap));
+
+}
+
 /* Ensure comparison data is available for the current input and selected
    source. Returns 1 when VP consumers can safely read compare data. */
 u8 vp_ensure_cmp_data_ready(afl_state_t *afl, void *mem, u32 len) {
@@ -663,6 +691,105 @@ static inline u8 vp_is_better(u32 cand_dist, u64 cand_cost, u32 old_dist,
 
 }
 
+static inline u32 vp_owned_site_lower_bound(const struct queue_entry *q,
+                                            u16 site_id, u8 *found) {
+
+  u32 left = 0, right = q ? q->vp_owned_site_cnt : 0;
+  while (left < right) {
+
+    u32 mid = left + ((right - left) >> 1);
+    u16 mid_site = q->vp_owned_sites[mid];
+    if (mid_site < site_id) {
+
+      left = mid + 1;
+
+    } else {
+
+      right = mid;
+
+    }
+
+  }
+
+  if (found) {
+
+    *found = (u8)(q && left < q->vp_owned_site_cnt &&
+                  q->vp_owned_sites[left] == site_id);
+
+  }
+
+  return left;
+
+}
+
+static inline void vp_owned_site_add(struct queue_entry *q, u16 site_id) {
+
+  if (!q) return;
+
+  u8  found = 0;
+  u32 pos = vp_owned_site_lower_bound(q, site_id, &found);
+  if (found) return;
+
+  if (q->vp_owned_site_cnt == q->vp_owned_site_cap) {
+
+    u32 new_cap = q->vp_owned_site_cap ? q->vp_owned_site_cap << 1 : 4;
+    q->vp_owned_sites =
+        ck_realloc(q->vp_owned_sites, new_cap * sizeof(*q->vp_owned_sites));
+    q->vp_owned_site_cap = new_cap;
+
+  }
+
+  if (pos < q->vp_owned_site_cnt) {
+
+    memmove(&q->vp_owned_sites[pos + 1], &q->vp_owned_sites[pos],
+            (q->vp_owned_site_cnt - pos) * sizeof(*q->vp_owned_sites));
+
+  }
+
+  q->vp_owned_sites[pos] = site_id;
+  ++q->vp_owned_site_cnt;
+
+}
+
+static inline void vp_owned_site_remove(struct queue_entry *q, u16 site_id) {
+
+  if (!q || !q->vp_owned_site_cnt) return;
+
+  u8  found = 0;
+  u32 pos = vp_owned_site_lower_bound(q, site_id, &found);
+  if (!found) return;
+
+  if (pos + 1 < q->vp_owned_site_cnt) {
+
+    memmove(&q->vp_owned_sites[pos], &q->vp_owned_sites[pos + 1],
+            (q->vp_owned_site_cnt - pos - 1) * sizeof(*q->vp_owned_sites));
+
+  }
+
+  --q->vp_owned_site_cnt;
+
+}
+
+static inline u8 vp_site_owned_elsewhere(afl_state_t *afl, u16 site_id,
+                                         const struct queue_entry *q,
+                                         size_t                    skip_idx) {
+
+  if (!afl || !q || !afl->vp_frontier) return 0;
+
+  size_t base = vp_site_base(afl, site_id);
+  size_t span = vp_frontier_site_span(afl);
+  for (size_t rel = 0; rel < span; ++rel) {
+
+    size_t idx = base + rel;
+    if (idx == skip_idx) continue;
+    if (afl->vp_frontier[idx].owner == q) return 1;
+
+  }
+
+  return 0;
+
+}
+
 /* Disable stale VP-only entries once they are no longer referenced by any
    frontier slot and have survived at least one queue cycle. */
 static inline void vp_maybe_disable_entry(afl_state_t        *afl,
@@ -688,6 +815,8 @@ static inline void vp_dec_ref(afl_state_t *afl, struct queue_entry *q) {
 
   if (!q || !q->vp_ref_cnt) return;
   --q->vp_ref_cnt;
+  ++q->vp_taint_owner_generation;
+  if (q->vp_taint_done || q->vp_taint_resume) { q->vp_taint_needs_refresh = 1; }
   if (!q->vp_ref_cnt) {
 
     if (q->vp_trim_deferred) {
@@ -709,15 +838,29 @@ static inline void vp_inc_ref(struct queue_entry *q) {
 
   if (!q) return;
   ++q->vp_ref_cnt;
-  if (q->vp_taint_done) q->vp_taint_needs_refresh = 1;
+  ++q->vp_taint_owner_generation;
+  if (q->vp_taint_done || q->vp_taint_resume) { q->vp_taint_needs_refresh = 1; }
 
 }
 
 /* Reset one frontier slot to the empty sentinel state. */
 static inline void vp_clear_slot(afl_state_t *afl, size_t idx) {
 
+  size_t              site_span = vp_frontier_site_span(afl);
+  u16                 site_id = (u16)(idx / site_span);
   struct queue_entry *old = afl->vp_frontier[idx].owner;
-  if (old) vp_dec_ref(afl, old);
+  if (old) {
+
+    if (!vp_site_owned_elsewhere(afl, site_id, old, idx)) {
+
+      vp_owned_site_remove(old, site_id);
+
+    }
+
+    vp_dec_ref(afl, old);
+
+  }
+
   afl->vp_frontier[idx].owner = NULL;
   afl->vp_frontier[idx].dist = VP_DIST_UNSOLVED;
   afl->vp_frontier[idx].tag = 0;
@@ -727,8 +870,7 @@ static inline void vp_clear_slot(afl_state_t *afl, size_t idx) {
   if (afl->value_profile_source == VP_SOURCE_RUNTIME_SHM &&
       afl->vp_runtime_slot_mask) {
 
-    size_t site_span = vp_frontier_site_span(afl);
-    u32    site = (u32)(idx / site_span);
+    u32 site = (u32)(idx / site_span);
     u16 slot_rel = (u16)(((idx % site_span) / VP_RUNTIME_SLOT_REPLICA_LIMIT));
     vp_runtime_slot_mask_recompute(afl, site, slot_rel);
 
@@ -953,6 +1095,7 @@ void vp_mark_favored_runtime_slots(afl_state_t *afl) {
 typedef struct {
 
   size_t base;                   /* First frontier index for this site      */
+  u32    site;                   /* Compare site index                      */
   u16    slots;                  /* Active slots for this run (1..16)       */
   s32    first_empty_rel;        /* First empty slot (relative), else -1    */
   s32    worst_rel;              /* Worst resident slot (relative), else -1 */
@@ -1148,8 +1291,24 @@ static inline u8 vp_frontier_runtime_slot_apply_ctx(
   }
 
   struct queue_entry *old = afl->vp_frontier[chosen_idx].owner;
-  if (old && old != q) vp_dec_ref(afl, old);
-  if (old != q) { vp_inc_ref(q); }
+  if (old && old != q) {
+
+    if (!vp_site_owned_elsewhere(afl, (u16)ctx->site, old, chosen_idx)) {
+
+      vp_owned_site_remove(old, (u16)ctx->site);
+
+    }
+
+    vp_dec_ref(afl, old);
+
+  }
+
+  if (old != q) {
+
+    vp_inc_ref(q);
+    vp_owned_site_add(q, (u16)ctx->site);
+
+  }
 
   afl->vp_frontier[chosen_idx].owner = q;
   afl->vp_frontier[chosen_idx].tag = tag;
@@ -1204,6 +1363,7 @@ static inline void vp_frontier_site_ctx_init(afl_state_t *afl, u32 site,
                                              vp_frontier_site_ctx_t *ctx) {
 
   ctx->base = vp_site_base(afl, site);
+  ctx->site = site;
   ctx->slots = (u16)afl->value_profile_slots;
 
   if (clear_stale) {
@@ -1322,8 +1482,24 @@ static inline u8 vp_frontier_site_apply_ctx(afl_state_t            *afl,
   }
 
   struct queue_entry *old = afl->vp_frontier[chosen_idx].owner;
-  if (old && old != q) vp_dec_ref(afl, old);
-  if (old != q) { vp_inc_ref(q); }
+  if (old && old != q) {
+
+    if (!vp_site_owned_elsewhere(afl, (u16)ctx->site, old, chosen_idx)) {
+
+      vp_owned_site_remove(old, (u16)ctx->site);
+
+    }
+
+    vp_dec_ref(afl, old);
+
+  }
+
+  if (old != q) {
+
+    vp_inc_ref(q);
+    vp_owned_site_add(q, (u16)ctx->site);
+
+  }
 
   afl->vp_frontier[chosen_idx].owner = q;
   afl->vp_frontier[chosen_idx].tag = tag;
@@ -1521,7 +1697,7 @@ struct vp_trim_guard {
   vp_trim_req_t      *req;
   u32                 req_cnt;
   u32                 req_cap;
-  u32                *site_ids;
+  u16                *site_ids;
   u32                 site_cnt;
   u32                 site_cap;
   size_t             *owned_idx;
@@ -1550,12 +1726,12 @@ static inline void vp_trim_guard_add_site(vp_trim_guard_t *guard, u32 site) {
   if (guard->site_cnt == guard->site_cap) {
 
     u32 new_cap = guard->site_cap ? guard->site_cap << 1 : 8;
-    guard->site_ids = ck_realloc(guard->site_ids, new_cap * sizeof(u32));
+    guard->site_ids = ck_realloc(guard->site_ids, new_cap * sizeof(u16));
     guard->site_cap = new_cap;
 
   }
 
-  guard->site_ids[guard->site_cnt++] = site;
+  guard->site_ids[guard->site_cnt++] = (u16)site;
 
 }
 
@@ -1793,6 +1969,7 @@ void vp_trim_guard_before_exec(vp_trim_guard_t *guard) {
 
   }
 
+  vp_runtime_set_site_filter(guard->afl, guard->site_ids, guard->site_cnt);
   guard->runtime_sandboxed = 1;
 
 }
@@ -1873,6 +2050,7 @@ void vp_trim_guard_after_exec(vp_trim_guard_t *guard) {
 
   }
 
+  vp_runtime_clear_site_filter(guard->afl);
   guard->runtime_sandboxed = 0;
 
 }

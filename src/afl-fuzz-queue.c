@@ -795,7 +795,8 @@ void destroy_queue(afl_state_t *afl) {
     }
 
     vp_taint_resume_free(q);
-    if (q->vp_taint) { vp_taint_free(q); }
+    vp_taint_free(q);
+    ck_free(q->vp_owned_sites);
 
     ck_free(q);
 

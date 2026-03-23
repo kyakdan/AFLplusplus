@@ -70,6 +70,7 @@ struct vp_taint_resume {
   u32                    *sensitive_caps;
   u32                   **sensitive_bufs;
   u32                     exec_cnt;
+  u32                     owner_generation;
 
 };
 
@@ -78,7 +79,9 @@ typedef struct {
   u32 magic;
   u32 version;
   u32 len;
-  u32 site_cnt;
+  u32 analyzed_site_cnt;
+  u32 sensitive_site_cnt;
+  u32 slot_count;
 
 } vp_taint_file_header_t;
 
@@ -91,7 +94,7 @@ typedef struct {
 } vp_taint_file_site_t;
 
 #define VP_TAINT_FILE_MAGIC 0x56505431U                           /* "VPT1" */
-#define VP_TAINT_FILE_VERSION 1U
+#define VP_TAINT_FILE_VERSION 2U
 
 static void collect_owned_sites(afl_state_t *afl, struct queue_entry *q,
                                 u16 **out_sites, u32 *out_cnt);
@@ -181,14 +184,81 @@ static inline u8 vp_taint_site_state_changed(
 
 }
 
+static inline u32 vp_taint_site_array_lower_bound(const u16 *sites, u32 cnt,
+                                                  u16 site_id, u8 *found) {
+
+  u32 left = 0, right = cnt;
+  while (left < right) {
+
+    u32 mid = left + ((right - left) >> 1);
+    if (sites[mid] < site_id) {
+
+      left = mid + 1;
+
+    } else {
+
+      right = mid;
+
+    }
+
+  }
+
+  if (found) { *found = (u8)(left < cnt && sites[left] == site_id); }
+  return left;
+
+}
+
+static inline u8 vp_taint_site_array_contains(const u16 *sites, u32 cnt,
+                                              u16 site_id) {
+
+  u8 found = 0;
+  (void)vp_taint_site_array_lower_bound(sites, cnt, site_id, &found);
+  return found;
+
+}
+
+static inline u8 vp_taint_analyzed_site_contains(const struct queue_entry *q,
+                                                 u16 site_id) {
+
+  if (!q || !q->vp_taint_analyzed_sites) return 0;
+  return vp_taint_site_array_contains(q->vp_taint_analyzed_sites,
+                                      q->vp_taint_analyzed_cnt, site_id);
+
+}
+
 /* Check whether queue entry q owns any frontier slot for the given site. */
 u8 vp_taint_site_owned(afl_state_t *afl, u16 site_id, struct queue_entry *q) {
 
-  size_t span = vp_taint_site_span(afl);
-  size_t base = (size_t)site_id * span;
-  for (size_t rel = 0; rel < span; rel++) {
+  (void)afl;
+  if (!q || !q->vp_owned_sites) return 0;
+  return vp_taint_site_array_contains(q->vp_owned_sites, q->vp_owned_site_cnt,
+                                      site_id);
 
-    if (afl->vp_frontier[base + rel].owner == q) return 1;
+}
+
+u8 vp_taint_has_missing_owned_sites(afl_state_t *afl, struct queue_entry *q) {
+
+  if (!afl || !q || !q->vp_ref_cnt || !q->vp_taint_done) return 0;
+
+  if (!q->vp_owned_site_cnt) return 0;
+
+  u32 analyzed_idx = 0;
+  for (u32 owned_idx = 0; owned_idx < q->vp_owned_site_cnt; ++owned_idx) {
+
+    u16 site_id = q->vp_owned_sites[owned_idx];
+    while (analyzed_idx < q->vp_taint_analyzed_cnt &&
+           q->vp_taint_analyzed_sites[analyzed_idx] < site_id) {
+
+      ++analyzed_idx;
+
+    }
+
+    if (analyzed_idx >= q->vp_taint_analyzed_cnt ||
+        q->vp_taint_analyzed_sites[analyzed_idx] != site_id) {
+
+      return 1;
+
+    }
 
   }
 
@@ -196,66 +266,13 @@ u8 vp_taint_site_owned(afl_state_t *afl, u16 site_id, struct queue_entry *q) {
 
 }
 
-u8 vp_taint_has_missing_owned_sites(afl_state_t *afl, struct queue_entry *q) {
-
-  if (!afl || !q || !q->vp_ref_cnt || !q->vp_taint_done)
-    return 0;
-
-  u16 *owned_sites = NULL;
-  u32  n_owned = 0;
-  collect_owned_sites(afl, q, &owned_sites, &n_owned);
-  if (!n_owned) {
-
-    ck_free(owned_sites);
-    return 0;
-
-  }
-
-  if (!q->vp_taint) {
-
-    ck_free(owned_sites);
-    return 1;
-
-  }
-
-  u8 missing = 0;
-  for (u32 i = 0; i < n_owned; i++) {
-
-    u16 sid = owned_sites[i];
-    u8  found = 0;
-    for (vp_taint_site_t *node = q->vp_taint; node; node = node->next) {
-
-      if (node->site_id == sid) {
-
-        found = 1;
-        break;
-
-      }
-
-    }
-
-    if (!found) {
-
-      missing = 1;
-      break;
-
-    }
-
-  }
-
-  ck_free(owned_sites);
-  return missing;
-
-}
-
-/* Enumerate owned frontier sites for queue entry q by scanning the
-   frontier directly. Single-pass with vp_ref_cnt-based early exit. */
+/* Copy the queue entry's sorted owned-site snapshot. */
 static void collect_owned_sites(afl_state_t *afl, struct queue_entry *q,
                                 u16 **out_sites, u32 *out_cnt) {
 
   if (!out_sites || !out_cnt) return;
 
-  if (!afl || !q || !afl->vp_frontier || !q->vp_ref_cnt) {
+  if (!afl || !q || !q->vp_owned_site_cnt) {
 
     *out_sites = NULL;
     *out_cnt = 0;
@@ -263,51 +280,11 @@ static void collect_owned_sites(afl_state_t *afl, struct queue_entry *q,
 
   }
 
-  u32    refs_left = q->vp_ref_cnt;
-  size_t span = vp_taint_site_span(afl);
+  (void)afl;
 
-  /* Pre-allocate up to max possible unique sites. */
-  u32 prealloc = MIN(refs_left, (u32)CMP_MAP_W);
-  u16 *sites = ck_alloc(prealloc * sizeof(u16));
-  u32  cnt = 0;
-
-  for (u32 site = 0; site < CMP_MAP_W && refs_left; site++) {
-
-    size_t base = (size_t)site * span;
-    u8     found = 0;
-
-    for (size_t rel = 0; rel < span; rel++) {
-
-      vp_frontier_entry_t *e = &afl->vp_frontier[base + rel];
-      if (e->owner == q) {
-
-        found = 1;
-        refs_left--;
-
-      }
-
-    }
-
-    if (found) {
-
-      sites[cnt] = (u16)site;
-      cnt++;
-
-    }
-
-  }
-
-  if (!cnt) {
-
-    ck_free(sites);
-    *out_sites = NULL;
-    *out_cnt = 0;
-    return;
-
-  }
-
-  *out_sites = sites;
-  *out_cnt = cnt;
+  *out_sites = ck_alloc(q->vp_owned_site_cnt * sizeof(u16));
+  memcpy(*out_sites, q->vp_owned_sites, q->vp_owned_site_cnt * sizeof(u16));
+  *out_cnt = q->vp_owned_site_cnt;
 
 }
 
@@ -356,11 +333,13 @@ static u8 vp_taint_exec(afl_state_t *afl, u8 *buf, u32 len, u16 *owned_sites,
 
   }
 
+  vp_runtime_set_site_filter(afl, owned_sites, n_owned);
   fsrv_run_result_t fault =
       fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
 
   if (afl->stop_soon || fault != FSRV_RUN_OK) {
 
+    vp_runtime_clear_site_filter(afl);
     for (u32 i = 0; i < n_owned; i++)
       vp->site[owned_sites[i]] = saved_sites[i];
     return 1;
@@ -404,6 +383,7 @@ static u8 vp_taint_exec(afl_state_t *afl, u8 *buf, u32 len, u16 *owned_sites,
 
   }
 
+  vp_runtime_clear_site_filter(afl);
   return 0;
 
 }
@@ -824,12 +804,48 @@ void vp_taint_resume_free(struct queue_entry *q) {
 
 }
 
+static void vp_taint_set_analyzed_sites(struct queue_entry *q, const u16 *sites,
+                                        u32 cnt) {
+
+  if (!q) return;
+
+  ck_free(q->vp_taint_analyzed_sites);
+  q->vp_taint_analyzed_sites = NULL;
+  q->vp_taint_analyzed_cnt = 0;
+
+  if (!sites || !cnt) return;
+
+  q->vp_taint_analyzed_sites = ck_alloc(cnt * sizeof(u16));
+  memcpy(q->vp_taint_analyzed_sites, sites, cnt * sizeof(u16));
+  q->vp_taint_analyzed_cnt = cnt;
+
+}
+
 static void vp_taint_build_list_from_resume(struct queue_entry *q) {
 
   vp_taint_resume_t *st = q->vp_taint_resume;
   if (!st) return;
   if (!st->owned_sites || !st->sensitive_cnts || !st->sensitive_bufs) return;
 
+  vp_taint_set_analyzed_sites(q, st->owned_sites, st->n_owned);
+
+  ck_free(q->vp_taint);
+  q->vp_taint = NULL;
+  q->vp_taint_cnt = 0;
+
+  u32 kept = 0;
+  for (u32 i = 0; i < st->n_owned; i++) {
+
+    if (st->sensitive_cnts[i]) ++kept;
+
+  }
+
+  if (!kept) return;
+
+  q->vp_taint = ck_alloc(kept * sizeof(vp_taint_site_t));
+  q->vp_taint_cnt = kept;
+
+  u32 out_idx = 0;
   for (u32 i = 0; i < st->n_owned; i++) {
 
     if (!st->sensitive_cnts[i]) {
@@ -840,14 +856,12 @@ static void vp_taint_build_list_from_resume(struct queue_entry *q) {
 
     }
 
-    vp_taint_site_t *node = ck_alloc(sizeof(vp_taint_site_t));
-    node->site_id = st->owned_sites[i];
-    node->sensitive_cnt = st->sensitive_cnts[i];
-    node->sensitive_positions =
+    vp_taint_site_t *site = &q->vp_taint[out_idx++];
+    site->site_id = st->owned_sites[i];
+    site->sensitive_cnt = st->sensitive_cnts[i];
+    site->sensitive_positions =
         ck_realloc(st->sensitive_bufs[i], st->sensitive_cnts[i] * sizeof(u32));
     st->sensitive_bufs[i] = NULL;
-    node->next = q->vp_taint;
-    q->vp_taint = node;
 
   }
 
@@ -903,16 +917,17 @@ static u8 vp_taint_write_exact(int fd, const void *buf, size_t len) {
 
 }
 
-static void vp_taint_free_site_list(vp_taint_site_t *head) {
+static void vp_taint_free_site_list(vp_taint_site_t *sites, u32 site_cnt) {
 
-  while (head) {
+  if (!sites) return;
 
-    vp_taint_site_t *next = head->next;
-    ck_free(head->sensitive_positions);
-    ck_free(head);
-    head = next;
+  for (u32 i = 0; i < site_cnt; ++i) {
+
+    ck_free(sites[i].sensitive_positions);
 
   }
+
+  ck_free(sites);
 
 }
 
@@ -923,35 +938,37 @@ static void vp_taint_save_state(afl_state_t *afl, struct queue_entry *q) {
   char fn[PATH_MAX];
   vp_taint_state_filename(afl, q, fn, sizeof(fn));
 
-  u32 site_cnt = 0;
-  for (vp_taint_site_t *n = q->vp_taint; n; n = n->next) {
-
-    if (n->sensitive_cnt) site_cnt++;
-
-  }
-
   vp_taint_file_header_t hdr = {.magic = VP_TAINT_FILE_MAGIC,
                                 .version = VP_TAINT_FILE_VERSION,
                                 .len = q->len,
-                                .site_cnt = site_cnt};
+                                .analyzed_site_cnt = q->vp_taint_analyzed_cnt,
+                                .sensitive_site_cnt = q->vp_taint_cnt,
+                                .slot_count = afl->value_profile_slots};
 
   int fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, afl->perm);
   if (fd < 0) return;
 
   u8 ok = vp_taint_write_exact(fd, &hdr, sizeof(hdr));
-  for (vp_taint_site_t *n = q->vp_taint; ok && n; n = n->next) {
+  if (ok && hdr.analyzed_site_cnt) {
 
-    if (!n->sensitive_cnt) continue;
+    ok = vp_taint_write_exact(fd, q->vp_taint_analyzed_sites,
+                              hdr.analyzed_site_cnt * sizeof(u16));
+
+  }
+
+  for (u32 i = 0; ok && i < q->vp_taint_cnt; ++i) {
+
+    vp_taint_site_t *site = &q->vp_taint[i];
 
     vp_taint_file_site_t sh = {
 
-        .site_id = n->site_id,
+        .site_id = site->site_id,
         .reserved = 0,
-        .sensitive_cnt = n->sensitive_cnt};
+        .sensitive_cnt = site->sensitive_cnt};
     ok = vp_taint_write_exact(fd, &sh, sizeof(sh));
     if (!ok) break;
-    ok = vp_taint_write_exact(fd, n->sensitive_positions,
-                              n->sensitive_cnt * sizeof(u32));
+    ok = vp_taint_write_exact(fd, site->sensitive_positions,
+                              site->sensitive_cnt * sizeof(u32));
 
   }
 
@@ -962,7 +979,9 @@ static void vp_taint_save_state(afl_state_t *afl, struct queue_entry *q) {
 
 void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
 
-  if (!afl || !q || q->vp_taint_done || q->vp_taint || !afl->out_dir) return;
+  if (!afl || !q || q->vp_taint_done || q->vp_taint ||
+      q->vp_taint_analyzed_sites || !afl->out_dir)
+    return;
   if (afl->value_profile_level != 1) return;
 
   char fn[PATH_MAX];
@@ -974,14 +993,16 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
   vp_taint_file_header_t hdr;
   if (!vp_taint_read_exact(fd, &hdr, sizeof(hdr)) ||
       hdr.magic != VP_TAINT_FILE_MAGIC ||
-      hdr.version != VP_TAINT_FILE_VERSION || hdr.len != q->len) {
+      hdr.version != VP_TAINT_FILE_VERSION || hdr.len != q->len ||
+      hdr.slot_count != afl->value_profile_slots) {
 
     close(fd);
     return;
 
   }
 
-  if (hdr.site_cnt > CMP_MAP_W) {
+  if (hdr.analyzed_site_cnt > CMP_MAP_W ||
+      hdr.sensitive_site_cnt > hdr.analyzed_site_cnt) {
 
     close(fd);
     unlink(fn);
@@ -989,10 +1010,28 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
 
   }
 
+  u16             *analyzed_sites = NULL;
   vp_taint_site_t *loaded = NULL;
   u8               ok = 1;
+  if (hdr.analyzed_site_cnt) {
 
-  for (u32 i = 0; i < hdr.site_cnt; i++) {
+    analyzed_sites = ck_alloc(hdr.analyzed_site_cnt * sizeof(u16));
+    if (!vp_taint_read_exact(fd, analyzed_sites,
+                             hdr.analyzed_site_cnt * sizeof(u16))) {
+
+      ok = 0;
+
+    }
+
+  }
+
+  if (hdr.sensitive_site_cnt) {
+
+    loaded = ck_alloc(hdr.sensitive_site_cnt * sizeof(vp_taint_site_t));
+
+  }
+
+  for (u32 i = 0; ok && i < hdr.sensitive_site_cnt; i++) {
 
     vp_taint_file_site_t sh;
     if (!vp_taint_read_exact(fd, &sh, sizeof(sh))) {
@@ -1009,15 +1048,15 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
 
     }
 
-    vp_taint_site_t *node = ck_alloc(sizeof(vp_taint_site_t));
-    node->site_id = sh.site_id;
-    node->sensitive_cnt = sh.sensitive_cnt;
-    node->sensitive_positions = ck_alloc(sh.sensitive_cnt * sizeof(u32));
-    if (!vp_taint_read_exact(fd, node->sensitive_positions,
+    vp_taint_site_t *site = &loaded[i];
+    site->site_id = sh.site_id;
+    site->sensitive_cnt = sh.sensitive_cnt;
+    site->sensitive_positions = ck_alloc(sh.sensitive_cnt * sizeof(u32));
+    if (!vp_taint_read_exact(fd, site->sensitive_positions,
                              sh.sensitive_cnt * sizeof(u32))) {
 
-      ck_free(node->sensitive_positions);
-      ck_free(node);
+      ck_free(site->sensitive_positions);
+      site->sensitive_positions = NULL;
       ok = 0;
       break;
 
@@ -1025,7 +1064,7 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
 
     for (u32 j = 0; j < sh.sensitive_cnt; j++) {
 
-      if (node->sensitive_positions[j] >= q->len) {
+      if (site->sensitive_positions[j] >= q->len) {
 
         ok = 0;
         break;
@@ -1036,14 +1075,21 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
 
     if (!ok) {
 
-      ck_free(node->sensitive_positions);
-      ck_free(node);
+      ck_free(site->sensitive_positions);
+      site->sensitive_positions = NULL;
       break;
 
     }
 
-    node->next = loaded;
-    loaded = node;
+    if (!vp_taint_site_array_contains(analyzed_sites, hdr.analyzed_site_cnt,
+                                      site->site_id)) {
+
+      ck_free(site->sensitive_positions);
+      site->sensitive_positions = NULL;
+      ok = 0;
+      break;
+
+    }
 
   }
 
@@ -1051,13 +1097,17 @@ void vp_taint_load_state(afl_state_t *afl, struct queue_entry *q) {
 
   if (!ok) {
 
-    vp_taint_free_site_list(loaded);
+    ck_free(analyzed_sites);
+    vp_taint_free_site_list(loaded, hdr.sensitive_site_cnt);
     unlink(fn);
     return;
 
   }
 
+  q->vp_taint_analyzed_sites = analyzed_sites;
+  q->vp_taint_analyzed_cnt = hdr.analyzed_site_cnt;
   q->vp_taint = loaded;
+  q->vp_taint_cnt = hdr.sensitive_site_cnt;
   q->vp_taint_done = 1;
   q->vp_taint_needs_refresh = 0;
   q->vp_taint_refresh_streak = 0;
@@ -1072,6 +1122,13 @@ void vp_taint_analyze(afl_state_t *afl, struct queue_entry *q) {
   if (!q->vp_ref_cnt) return;
   if (!afl->shm.vp_map) return;
   if (q->len < 2) return;
+
+  if (q->vp_taint_resume &&
+      q->vp_taint_resume->owner_generation != q->vp_taint_owner_generation) {
+
+    vp_taint_resume_free(q);
+
+  }
 
   /* One-time per-entry analysis. Once persisted, keep and reuse it
      independently of later frontier ownership churn. */
@@ -1093,6 +1150,7 @@ void vp_taint_analyze(afl_state_t *afl, struct queue_entry *q) {
     /* First run for this entry: collect baseline and build phase-2 plan. */
     vp_taint_resume_t *st = ck_alloc(sizeof(vp_taint_resume_t));
     q->vp_taint_resume = st;
+    st->owner_generation = q->vp_taint_owner_generation;
 
     collect_owned_sites(afl, q, &st->owned_sites, &st->n_owned);
     if (!st->n_owned) {
@@ -1251,33 +1309,29 @@ u32 vp_taint_rand_pos(afl_state_t *afl, vp_taint_site_t *site, u32 max_pos) {
 
 void vp_taint_free(struct queue_entry *q) {
 
-  if (!q || !q->vp_taint) {
+  if (!q) { return; }
 
-    if (q) {
+  if (!q->vp_taint && !q->vp_taint_analyzed_sites) {
 
-      q->vp_taint = NULL;
-      q->vp_taint_done = 0;
-      q->vp_taint_needs_refresh = 0;
-      q->vp_taint_refresh_streak = 0;
-      q->vp_taint_refresh_cooldown = 0;
-
-    }
+    q->vp_taint = NULL;
+    q->vp_taint_cnt = 0;
+    q->vp_taint_analyzed_sites = NULL;
+    q->vp_taint_analyzed_cnt = 0;
+    q->vp_taint_done = 0;
+    q->vp_taint_needs_refresh = 0;
+    q->vp_taint_refresh_streak = 0;
+    q->vp_taint_refresh_cooldown = 0;
 
     return;
 
   }
 
-  vp_taint_site_t *node = q->vp_taint;
-  while (node) {
-
-    vp_taint_site_t *next = node->next;
-    ck_free(node->sensitive_positions);
-    ck_free(node);
-    node = next;
-
-  }
-
+  vp_taint_free_site_list(q->vp_taint, q->vp_taint_cnt);
   q->vp_taint = NULL;
+  q->vp_taint_cnt = 0;
+  ck_free(q->vp_taint_analyzed_sites);
+  q->vp_taint_analyzed_sites = NULL;
+  q->vp_taint_analyzed_cnt = 0;
   q->vp_taint_done = 0;
   q->vp_taint_needs_refresh = 0;
   q->vp_taint_refresh_streak = 0;

@@ -459,11 +459,7 @@ static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
       (u8)(q->vp_taint_resume || (!q->vp_taint_done && q->vp_taint) ||
            taint_refresh_triggered);
 
-  if (taint_repair_needed || taint_first_needed) {
-
-    vp_taint_analyze(afl, q);
-
-  }
+  if (taint_repair_needed || taint_first_needed) { vp_taint_analyze(afl, q); }
 
   if (taint_refresh_triggered && vp_taint_ready(q)) {
 
@@ -477,9 +473,9 @@ static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
 
 static void vp_prepare_active_taint_sites(afl_state_t        *afl,
                                           struct queue_entry *q,
-                                          u8 splice_cycle,
-                                          vp_taint_site_t ***out_sites,
-                                          u32               *out_cnt) {
+                                          u8                  splice_cycle,
+                                          vp_taint_site_t  ***out_sites,
+                                          u32                *out_cnt) {
 
   *out_sites = NULL;
   *out_cnt = 0;
@@ -491,13 +487,12 @@ static void vp_prepare_active_taint_sites(afl_state_t        *afl,
   if (!vp_taint_ready(q) || !q->vp_taint) return;
 
   u8 have_owned = 0;
-  for (vp_taint_site_t *node = q->vp_taint; node; node = node->next) {
+  *out_sites = ck_alloc(q->vp_taint_cnt * sizeof(**out_sites));
+  for (u32 i = 0; i < q->vp_taint_cnt; ++i) {
 
+    vp_taint_site_t *node = &q->vp_taint[i];
     if (node->sensitive_cnt > 0 && vp_taint_site_owned(afl, node->site_id, q)) {
 
-      vp_taint_site_t **tmp =
-          ck_realloc(*out_sites, (*out_cnt + 1U) * sizeof(vp_taint_site_t *));
-      *out_sites = tmp;
       (*out_sites)[(*out_cnt)++] = node;
       have_owned = 1;
 
@@ -507,12 +502,11 @@ static void vp_prepare_active_taint_sites(afl_state_t        *afl,
 
   if (have_owned) return;
 
-  for (vp_taint_site_t *node = q->vp_taint; node; node = node->next) {
+  *out_cnt = 0;
+  for (u32 i = 0; i < q->vp_taint_cnt; ++i) {
 
+    vp_taint_site_t *node = &q->vp_taint[i];
     if (!node->sensitive_cnt) continue;
-    vp_taint_site_t **tmp =
-        ck_realloc(*out_sites, (*out_cnt + 1U) * sizeof(vp_taint_site_t *));
-    *out_sites = tmp;
     (*out_sites)[(*out_cnt)++] = node;
 
   }
@@ -528,8 +522,9 @@ static u32 vp_build_sensitive_bitmap(afl_state_t *afl, struct queue_entry *q,
 
   u32 sensitive_cnt = 0;
   u8  have_owned = 0;
-  for (vp_taint_site_t *node = q->vp_taint; node; node = node->next) {
+  for (u32 n = 0; n < q->vp_taint_cnt; ++n) {
 
+    vp_taint_site_t *node = &q->vp_taint[n];
     if (!vp_taint_site_owned(afl, node->site_id, q)) continue;
     have_owned = 1;
 
@@ -546,8 +541,9 @@ static u32 vp_build_sensitive_bitmap(afl_state_t *afl, struct queue_entry *q,
 
   if (have_owned) return sensitive_cnt;
 
-  for (vp_taint_site_t *node = q->vp_taint; node; node = node->next) {
+  for (u32 n = 0; n < q->vp_taint_cnt; ++n) {
 
+    vp_taint_site_t *node = &q->vp_taint[n];
     for (u32 i = 0; i < node->sensitive_cnt; i++) {
 
       u32 pos = node->sensitive_positions[i];
@@ -929,7 +925,8 @@ u8 fuzz_one_original(afl_state_t *afl) {
       u32 sensitive_cnt = vp_build_sensitive_bitmap(afl, afl->queue_cur, len,
                                                     vp_det_skip_eff_map);
 
-      /* Broad taint disables VP-guided deterministic selection for this visit. */
+      /* Broad taint disables VP-guided deterministic selection for this visit.
+       */
       if (sensitive_cnt && (u64)sensitive_cnt * 4U < (u64)len * 3U) {
 
         vp_det_use_vp_map = 1;
