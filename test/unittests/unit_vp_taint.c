@@ -162,6 +162,61 @@ void vp_runtime_clear_site_filter(afl_state_t *afl) {
 
 }
 
+u8 vp_runtime_observe_begin(afl_state_t *afl, const u16 *site_ids, u32 site_cnt,
+                            vp_site_t *saved_sites,
+                            vp_runtime_observe_mode_t mode) {
+
+  vp_map_t *vp = afl ? afl->shm.vp_map : NULL;
+  if (!vp || !site_ids || !site_cnt || !saved_sites) return 0;
+
+  for (u32 i = 0; i < site_cnt; ++i) {
+
+    u16 site_id = site_ids[i];
+    saved_sites[i] = vp->site[site_id];
+
+    switch (mode) {
+
+      case VP_RUNTIME_OBSERVE_TAINT:
+        memset(&vp->site[site_id].slots, 0xFF,
+               sizeof(vp->site[site_id].slots));
+        vp->site[site_id].valid_mask = 0;
+        vp->site[site_id].touched_mask = 0;
+        vp->site[site_id].protected_mask = 0;
+        break;
+
+      case VP_RUNTIME_OBSERVE_TRIM:
+        memset(&vp->site[site_id], 0, sizeof(vp_site_t));
+        vp->site[site_id].exec_seen = vp->exec_id;
+        break;
+
+      default:
+        return 0;
+
+    }
+
+  }
+
+  vp_runtime_set_site_filter(afl, site_ids, site_cnt);
+  return 1;
+
+}
+
+void vp_runtime_observe_end(afl_state_t *afl, const u16 *site_ids, u32 site_cnt,
+                            const vp_site_t *saved_sites) {
+
+  vp_map_t *vp = afl ? afl->shm.vp_map : NULL;
+  if (!vp || !site_ids || !site_cnt || !saved_sites) return;
+
+  for (u32 i = 0; i < site_cnt; ++i) {
+
+    vp->site[site_ids[i]] = saved_sites[i];
+
+  }
+
+  vp_runtime_clear_site_filter(afl);
+
+}
+
 AFL_RAND_RETURN rand_next(afl_state_t *afl) {
 
   (void)afl;

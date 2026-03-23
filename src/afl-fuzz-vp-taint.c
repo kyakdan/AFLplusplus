@@ -288,23 +288,9 @@ static u8 vp_taint_exec(afl_state_t *afl, u8 *buf, u32 len, u16 *owned_sites,
                         vp_site_t *saved_sites) {
 
   vp_map_t *vp = afl->shm.vp_map;
-
-  /* Save entire vp_site_t for owned sites.  The VP hooks modify
-     valid_mask, slot_key, protected_mask, touched_mask, hit_count,
-     exec_seen — not just best_dist.  We must restore ALL of it to
-     avoid corrupting the VP map for subsequent frontier decisions. */
-  for (u32 i = 0; i < n_owned; i++) {
-
-    saved_sites[i] = vp->site[owned_sites[i]];
-
-    /* Reset all slots so the hooks record actual per-exec distances. */
-    memset(&vp->site[owned_sites[i]].slots, 0xFF,
-           sizeof(vp->site[owned_sites[i]].slots));
-    vp->site[owned_sites[i]].valid_mask = 0;
-    vp->site[owned_sites[i]].touched_mask = 0;
-    vp->site[owned_sites[i]].protected_mask = 0;
-
-  }
+  if (!vp_runtime_observe_begin(afl, owned_sites, n_owned, saved_sites,
+                                VP_RUNTIME_OBSERVE_TAINT))
+    return 1;
 
   /* Raw execution: write_to_testcase + fuzz_run_target.
      We deliberately skip common_fuzz_stuff / save_if_interesting
@@ -313,21 +299,17 @@ static u8 vp_taint_exec(afl_state_t *afl, u8 *buf, u32 len, u16 *owned_sites,
   u32   exec_len = write_to_testcase(afl, &exec_mem, len, 0);
   if (!exec_len) {
 
-    for (u32 i = 0; i < n_owned; i++)
-      vp->site[owned_sites[i]] = saved_sites[i];
+    vp_runtime_observe_end(afl, owned_sites, n_owned, saved_sites);
     return 1;
 
   }
 
-  vp_runtime_set_site_filter(afl, owned_sites, n_owned);
   fsrv_run_result_t fault =
       fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
 
   if (afl->stop_soon || fault != FSRV_RUN_OK) {
 
-    vp_runtime_clear_site_filter(afl);
-    for (u32 i = 0; i < n_owned; i++)
-      vp->site[owned_sites[i]] = saved_sites[i];
+    vp_runtime_observe_end(afl, owned_sites, n_owned, saved_sites);
     return 1;
 
   }
@@ -362,14 +344,7 @@ static u8 vp_taint_exec(afl_state_t *afl, u8 *buf, u32 len, u16 *owned_sites,
 
   }
 
-  /* Restore entire site state. */
-  for (u32 i = 0; i < n_owned; i++) {
-
-    vp->site[owned_sites[i]] = saved_sites[i];
-
-  }
-
-  vp_runtime_clear_site_filter(afl);
+  vp_runtime_observe_end(afl, owned_sites, n_owned, saved_sites);
   return 0;
 
 }

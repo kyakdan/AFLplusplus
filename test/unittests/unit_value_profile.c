@@ -896,6 +896,90 @@ static void test_runtime_trim_guard_preserve_and_regress(void **state) {
 
 }
 
+static void test_runtime_observe_helper_resets_and_restores_sites(
+    void **state) {
+
+  (void)state;
+
+  afl_state_t afl;
+  vp_map_t   *vp;
+  u16         site_ids[2] = {3, 9};
+  vp_site_t   saved[2];
+  vp_site_t   orig0, orig1, untouched;
+
+  memset(&afl, 0, sizeof(afl));
+  vp = calloc(1, sizeof(vp_map_t));
+  assert_non_null(vp);
+
+  afl.shm.vp_map = vp;
+  vp->enabled = 1;
+  vp->exec_id = 7;
+
+  vp->site[3].exec_seen = 11;
+  vp->site[3].hit_count = 2;
+  vp->site[3].valid_mask = 0x3;
+  vp->site[3].touched_mask = 0x1;
+  vp->site[3].protected_mask = 0x2;
+  vp->site[3].slots[0].slot_key = 0x1111;
+  vp->site[3].slots[0].best_dist = 9;
+
+  vp->site[9].exec_seen = 13;
+  vp->site[9].hit_count = 4;
+  vp->site[9].valid_mask = 0x7;
+  vp->site[9].touched_mask = 0x4;
+  vp->site[9].protected_mask = 0x1;
+  vp->site[9].slots[1].slot_key = 0x2222;
+  vp->site[9].slots[1].best_dist = 5;
+
+  vp->site[4].exec_seen = 21;
+  vp->site[4].valid_mask = 0x9;
+  vp->site[4].slots[0].slot_key = 0x3333;
+  vp->site[4].slots[0].best_dist = 12;
+
+  orig0 = vp->site[3];
+  orig1 = vp->site[9];
+  untouched = vp->site[4];
+
+  assert_true(vp_runtime_observe_begin(&afl, site_ids, 2, saved,
+                                       VP_RUNTIME_OBSERVE_TAINT));
+  assert_true(vp->filter_enabled);
+  assert_int_equal(vp->site[3].valid_mask, 0);
+  assert_int_equal(vp->site[3].touched_mask, 0);
+  assert_int_equal(vp->site[3].protected_mask, 0);
+  assert_int_equal(vp->site[3].slots[0].slot_key, 0xffff);
+  assert_int_equal(vp->site[3].slots[0].best_dist, 0xffff);
+  assert_memory_equal(&vp->site[4], &untouched, sizeof(vp_site_t));
+
+  vp->site[3].valid_mask = 1;
+  vp->site[9].valid_mask = 1;
+  vp_runtime_observe_end(&afl, site_ids, 2, saved);
+
+  assert_false(vp->filter_enabled);
+  assert_memory_equal(&vp->site[3], &orig0, sizeof(vp_site_t));
+  assert_memory_equal(&vp->site[9], &orig1, sizeof(vp_site_t));
+  assert_memory_equal(&vp->site[4], &untouched, sizeof(vp_site_t));
+
+  assert_true(vp_runtime_observe_begin(&afl, site_ids, 2, saved,
+                                       VP_RUNTIME_OBSERVE_TRIM));
+  assert_true(vp->filter_enabled);
+  assert_int_equal(vp->site[3].exec_seen, vp->exec_id);
+  assert_int_equal(vp->site[3].hit_count, 0);
+  assert_int_equal(vp->site[3].valid_mask, 0);
+  assert_int_equal(vp->site[3].slots[0].slot_key, 0);
+  assert_int_equal(vp->site[3].slots[0].best_dist, 0);
+
+  vp->site[3].valid_mask = 1;
+  vp->site[9].valid_mask = 1;
+  vp_runtime_observe_end(&afl, site_ids, 2, saved);
+
+  assert_false(vp->filter_enabled);
+  assert_memory_equal(&vp->site[3], &orig0, sizeof(vp_site_t));
+  assert_memory_equal(&vp->site[9], &orig1, sizeof(vp_site_t));
+
+  free(vp);
+
+}
+
 static void test_runtime_trim_guard_distinguishes_runtime_slots(void **state) {
 
   (void)state;
@@ -1158,6 +1242,7 @@ int main(int argc, char **argv) {
           test_l1_runtime_slot_mask_clears_stale_external_disable),
       cmocka_unit_test(
           test_runtime_frontier_retains_protected_same_tag_on_equal_dist),
+      cmocka_unit_test(test_runtime_observe_helper_resets_and_restores_sites),
       cmocka_unit_test(test_runtime_trim_guard_preserve_and_regress),
       cmocka_unit_test(test_runtime_trim_guard_distinguishes_runtime_slots),
       cmocka_unit_test(test_cmplog_inline_trim_guard_preserve_and_regress),

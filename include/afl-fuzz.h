@@ -361,6 +361,13 @@ typedef struct {
 
 typedef struct vp_trim_guard vp_trim_guard_t;
 
+typedef enum {
+
+  VP_RUNTIME_OBSERVE_TAINT = 0,
+  VP_RUNTIME_OBSERVE_TRIM = 1,
+
+} vp_runtime_observe_mode_t;
+
 struct extra_data {
 
   u8 *data;                             /* Dictionary token data            */
@@ -1432,6 +1439,9 @@ u8   vp_ensure_cmp_data_ready(afl_state_t *, void *, u32);
 void vp_prepare_exec(afl_state_t *, afl_forkserver_t *);
 void vp_runtime_set_site_filter(afl_state_t *, const u16 *, u32);
 void vp_runtime_clear_site_filter(afl_state_t *);
+u8   vp_runtime_observe_begin(afl_state_t *, const u16 *, u32, vp_site_t *,
+                              vp_runtime_observe_mode_t);
+void vp_runtime_observe_end(afl_state_t *, const u16 *, u32, const vp_site_t *);
 
 /* VP taint analysis (afl-fuzz-vp-taint.c) */
 

@@ -331,6 +331,67 @@ void vp_runtime_clear_site_filter(afl_state_t *afl) {
 
 }
 
+u8 vp_runtime_observe_begin(afl_state_t *afl, const u16 *site_ids, u32 site_cnt,
+                            vp_site_t                *saved_sites,
+                            vp_runtime_observe_mode_t mode) {
+
+  vp_map_t *vp = afl ? afl->shm.vp_map : NULL;
+  if (unlikely(!vp || !vp->enabled || !site_ids || !site_cnt || !saved_sites))
+    return 0;
+
+  for (u32 i = 0; i < site_cnt; ++i) {
+
+    u16 site_id = site_ids[i];
+    saved_sites[i] = vp->site[site_id];
+
+    switch (mode) {
+
+      case VP_RUNTIME_OBSERVE_TAINT:
+        memset(&vp->site[site_id].slots, 0xFF, sizeof(vp->site[site_id].slots));
+        vp->site[site_id].valid_mask = 0;
+        vp->site[site_id].touched_mask = 0;
+        vp->site[site_id].protected_mask = 0;
+        break;
+
+      case VP_RUNTIME_OBSERVE_TRIM:
+        memset(&vp->site[site_id], 0, sizeof(vp_site_t));
+        vp->site[site_id].exec_seen = vp->exec_id;
+        break;
+
+      default:
+        while (i--) {
+
+          vp->site[site_ids[i]] = saved_sites[i];
+
+        }
+
+        return 0;
+
+    }
+
+  }
+
+  vp_runtime_set_site_filter(afl, site_ids, site_cnt);
+  return 1;
+
+}
+
+void vp_runtime_observe_end(afl_state_t *afl, const u16 *site_ids, u32 site_cnt,
+                            const vp_site_t *saved_sites) {
+
+  vp_map_t *vp = afl ? afl->shm.vp_map : NULL;
+  if (unlikely(!vp || !site_ids || !site_cnt || !saved_sites)) return;
+
+  for (u32 i = 0; i < site_cnt; ++i) {
+
+    vp->site[site_ids[i]] = saved_sites[i];
+
+  }
+
+  vp_runtime_clear_site_filter(afl);
+
+}
+
 /* Ensure comparison data is available for the current input and selected
    source. Returns 1 when VP consumers can safely read compare data. */
 u8 vp_ensure_cmp_data_ready(afl_state_t *afl, void *mem, u32 len) {
@@ -1954,21 +2015,9 @@ void vp_trim_guard_before_exec(vp_trim_guard_t *guard) {
   if (unlikely(!guard || !guard->active)) return;
   if (guard->source != VP_SOURCE_RUNTIME_SHM) return;
 
-  vp_map_t *vp = guard->afl->shm.vp_map;
-  if (unlikely(!vp || !vp->enabled || !guard->site_cnt || !guard->site_backup))
-    return;
-
-  for (u32 i = 0; i < guard->site_cnt; ++i) {
-
-    u32 site_id = guard->site_ids[i];
-    guard->site_backup[i] = vp->site[site_id];
-    memset(&vp->site[site_id], 0, sizeof(vp_site_t));
-    vp->site[site_id].exec_seen = vp->exec_id;
-
-  }
-
-  vp_runtime_set_site_filter(guard->afl, guard->site_ids, guard->site_cnt);
-  guard->runtime_sandboxed = 1;
+  guard->runtime_sandboxed =
+      vp_runtime_observe_begin(guard->afl, guard->site_ids, guard->site_cnt,
+                               guard->site_backup, VP_RUNTIME_OBSERVE_TRIM);
 
 }
 
@@ -2034,21 +2083,8 @@ void vp_trim_guard_after_exec(vp_trim_guard_t *guard) {
   if (guard->source != VP_SOURCE_RUNTIME_SHM || !guard->runtime_sandboxed)
     return;
 
-  vp_map_t *vp = guard->afl->shm.vp_map;
-  if (unlikely(!vp || !guard->site_backup)) {
-
-    guard->runtime_sandboxed = 0;
-    return;
-
-  }
-
-  for (u32 i = 0; i < guard->site_cnt; ++i) {
-
-    vp->site[guard->site_ids[i]] = guard->site_backup[i];
-
-  }
-
-  vp_runtime_clear_site_filter(guard->afl);
+  vp_runtime_observe_end(guard->afl, guard->site_ids, guard->site_cnt,
+                         guard->site_backup);
   guard->runtime_sandboxed = 0;
 
 }
