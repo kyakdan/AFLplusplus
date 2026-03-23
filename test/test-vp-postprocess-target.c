@@ -1,7 +1,7 @@
 /*
-  Value-profile regression target.
+  Runtime value-profile regression target.
   It records the first five bytes it receives to VP_LOG_PATH so the test can
-  verify that CmpLog reruns observe post-processed buffers.
+  verify that VP-guided executions observe post-processed buffers.
  */
 
 #include <fcntl.h>

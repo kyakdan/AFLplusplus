@@ -400,24 +400,20 @@ checks or alter some of the more exotic semantics of the tool:
     session.
 
   - Value-profile guidance is controlled by command-line options:
-      - `-j 1|2`: enable value profiling at level 1 (runtime backend) or
-        level 2 (CmpLog backend). Without `-r`, VP is always active.
-      - `-r N`: stagnation mode. Enable VP after `N` seconds without new edge
-        coverage, and disable again after edge coverage recovers (after at
-        least one full queue cycle). If `-j` is omitted, level 1 is used.
+      - `-r 0`: enable runtime value profiling from startup.
+      - `-r N`: enable runtime value profiling after `N` seconds without new
+        edge coverage, and disable it again after edge coverage recovers
+        (after at least one full queue cycle).
     Additional tuning via environment variable:
       - `AFL_VALUE_PROFILE_SLOTS=K` (default: `16`, valid: `1..16`) controls
-        per-site frontier width for level 1 and is ignored for level 2.
+        per-site frontier width for runtime value profiling.
     Value profiling may help when compare operands are transformed in ways
     that make direct solve attempts less effective.
     Notes:
-      - Level 1 requires binaries compiled with
+      - Value profiling requires binaries compiled with
         `AFL_LLVM_VALUEPROFILE=1` (or `AFL_LLVM_VALUE_PROFILE=1`).
-      - Level 1 also supports per-entry VP taint analysis. See
+      - Runtime value profiling also supports per-entry VP taint analysis. See
         [value_profiling.md](value_profiling.md).
-      - Level 2 requires CmpLog compare data. Source precedence is:
-        inline CmpLog instrumentation in the main target first, then `-c`
-        CmpLog fallback.
       - Redqueen/colorization scheduling still requires explicit `-c`.
         Inline CmpLog availability alone does not schedule Redqueen.
       - With Level 2 and `-c` fallback source, VP performs extra CmpLog

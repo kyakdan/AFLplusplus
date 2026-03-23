@@ -5,34 +5,32 @@ Instead of only asking whether a comparison was reached, AFL++ also tracks how
 close the observed operands are to a match. This helps on transformed compares
 where direct solve attempts are weak or impossible.
 
-## Levels
+## Activation
 
-AFL++ supports two VP backends:
+Value profiling currently uses runtime VP instrumentation in the main target.
+Compile the target with `AFL_LLVM_VALUEPROFILE=1` or
+`AFL_LLVM_VALUE_PROFILE=1`.
 
-- `-j1`: level-1 runtime VP. The target must be compiled with
-  `AFL_LLVM_VALUEPROFILE=1` or `AFL_LLVM_VALUE_PROFILE=1`.
-- `-j2`: level-2 VP based on CmpLog compare data. AFL++ prefers inline compare
-  data from the main target and falls back to `-c` when needed.
+- `-r0`: enable value profiling from startup
+- `-rN`: enable value profiling after `N` seconds without new edge coverage,
+  and disable it again after edge coverage recovers
 
-Without `-r`, VP stays enabled from startup. With `-r N`, AFL++ enables VP
-after `N` seconds without new edge coverage and disables it again after edge
-coverage recovers.
+Without `-r`, value profiling stays disabled.
 
-`AFL_VALUE_PROFILE_SLOTS=K` controls the number of tracked runtime slots for
-level 1. The valid range is `1..16`.
+`AFL_VALUE_PROFILE_SLOTS=K` controls the number of tracked runtime slots. The
+valid range is `1..16`.
 
 ## Frontier
 
 VP maintains a frontier of the best known distances for `(site, slot)` pairs.
-Queue entries owning frontier slots are favored for more fuzzing. Level 1 keeps
-multiple runtime replicas per slot so independent operand streams at the same
-comparison site do not overwrite each other immediately.
+Queue entries owning frontier slots are favored for more fuzzing. Runtime VP
+keeps multiple runtime replicas per slot so independent operand streams at the
+same comparison site do not overwrite each other immediately.
 
-## Level-1 VP Taint
+## VP Taint
 
-Level-1 VP can run a per-entry taint analysis that answers a narrower
-question: which input byte positions affect the owned VP sites for this queue
-entry?
+Runtime VP can run a per-entry taint analysis that answers a narrower question:
+which input byte positions affect the owned VP sites for this queue entry?
 
 The current implementation is observational:
 
@@ -46,7 +44,7 @@ The analysis is two-phase:
 1. coarse perturbation marks byte regions that can change owned-site VP state
 2. per-byte replay confirms the final sensitive positions
 
-Only level-1 runtime VP uses this taint analysis.
+Only runtime VP uses this taint analysis.
 
 ## Freshness And Rebuilds
 
@@ -66,7 +64,7 @@ is different from missing coverage and is persisted explicitly.
 
 ## Persistence
 
-Completed level-1 VP taint is stored in:
+Completed VP taint is stored in:
 
 `queue/.state/vp_taint/<queue-id>`
 

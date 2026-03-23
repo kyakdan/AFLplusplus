@@ -269,12 +269,9 @@ static void usage(u8 *argv0, int more_help) {
       "compiled\n"
       "                  for CmpLog then use '-c 0'. To disable CMPLOG use '-c "
       "-'.\n"
-      "  -j level      - enable value profiling at level 1 (runtime) or 2 "
-      "(CmpLog)\n"
-      "                  without -r, value profiling is always active\n"
       "  -r seconds    - enable value profiling in stagnation mode after the\n"
-      "                  given number of seconds without new edge coverage\n"
-      "                  if -j is omitted, level 1 is used\n"
+      "                  given number of seconds without new edge coverage;\n"
+      "                  use -r0 for always-active runtime value profiling\n"
       "  -l cmplog_opts - CmpLog configuration values (e.g. \"2ATR\"):\n"
       "                  1=small files, 2=larger files (default), 3=all "
       "files,\n"
@@ -609,8 +606,7 @@ int main(int argc, char **argv_orig, char **envp) {
       map_size = get_map_size(), vp_stagnation_secs = 0;
   u8 *extras_dir[4];
   u8  mem_limit_given = 0, exit_1 = 0, debug = 0,
-     extras_dir_cnt = 0 /*, have_p = 0*/, vp_level = VP_LEVEL_DEFAULT,
-     vp_level_set = 0, vp_stagnation_set = 0;
+     extras_dir_cnt = 0 /*, have_p = 0*/, vp_requested = 0;
   char  *afl_preload;
   char  *san_abstraction;
   char  *frida_afl_preload = NULL;
@@ -862,44 +858,32 @@ int main(int argc, char **argv_orig, char **envp) {
 
       case 'j': {
 
-        if (vp_level_set) { FATAL("Multiple -j options not supported"); }
-
-        char         *endptr = NULL;
-        unsigned long level_val;
-        errno = 0;
-        level_val = strtoul(optarg, &endptr, 10);
-        if (errno == ERANGE || endptr == optarg || *endptr != '\0' ||
-            level_val < VP_LEVEL_MIN || level_val > VP_LEVEL_MAX) {
-
-          FATAL("Invalid -j level '%s'; expected %u or %u.", optarg,
-                VP_LEVEL_MIN, VP_LEVEL_MAX);
-
-        }
-
-        vp_level = (u8)level_val;
-        vp_level_set = 1;
-        break;
+        FATAL(
+            "Option -j was removed. Use -r0 for always-active value "
+            "profiling or -rN for stagnation-triggered value profiling.");
 
       }
 
       case 'r': {
 
-        if (vp_stagnation_set) { FATAL("Multiple -r options not supported"); }
+        if (vp_requested) { FATAL("Multiple -r options not supported"); }
 
         char         *endptr = NULL;
         unsigned long stag_val;
         errno = 0;
         stag_val = strtoul(optarg, &endptr, 10);
         if (errno == ERANGE || endptr == optarg || *endptr != '\0' ||
-            stag_val == 0 || stag_val > UINT_MAX) {
+            stag_val > UINT_MAX) {
 
-          FATAL("Invalid -r value '%s'; expected a positive number of seconds.",
-                optarg);
+          FATAL(
+              "Invalid -r value '%s'; expected 0 or a positive number of "
+              "seconds.",
+              optarg);
 
         }
 
         vp_stagnation_secs = (u32)stag_val;
-        vp_stagnation_set = 1;
+        vp_requested = 1;
         break;
 
       }
@@ -1941,13 +1925,13 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
-  /* -j enables VP at a selected level; -r enables stagnation mode.
-     If -r is used without -j, level 1 is selected by default. */
-  if (vp_level_set || vp_stagnation_set) {
+  /* -r0 enables always-on runtime VP; -rN enables stagnation-triggered
+     runtime VP after N seconds without new edge coverage. */
+  if (vp_requested) {
 
-    afl->value_profile_level = vp_level_set ? vp_level : VP_LEVEL_DEFAULT;
+    afl->value_profile_level = VP_LEVEL_DEFAULT;
 
-    if (vp_stagnation_set) {
+    if (vp_stagnation_secs) {
 
       afl->value_profile_mode = 2;
       afl->value_profile_active = 0;
@@ -1978,20 +1962,8 @@ int main(int argc, char **argv_orig, char **envp) {
 
     }
 
-    afl->value_profile_source =
-        afl->value_profile_level == 1 ? VP_SOURCE_RUNTIME_SHM : VP_SOURCE_NONE;
-
-    if (afl->value_profile_source == VP_SOURCE_RUNTIME_SHM) {
-
-      afl->shm.vp_mode = 1;
-
-    }
-
-    if (afl->value_profile_level == 2) {
-
-      afl->virgin_val_prof = ck_alloc(VALUE_PROFILE_MAP_SIZE);
-
-    }
+    afl->value_profile_source = VP_SOURCE_RUNTIME_SHM;
+    afl->shm.vp_mode = 1;
 
     afl->top_rated_vp = ck_alloc(CMP_MAP_W * sizeof(void *));
     afl->top_rated_vp_dist = ck_alloc(CMP_MAP_W * sizeof(u32));
@@ -2002,18 +1974,12 @@ int main(int argc, char **argv_orig, char **envp) {
 
     }
 
-    size_t vp_slot_replicas = afl->value_profile_source == VP_SOURCE_RUNTIME_SHM
-                                  ? VP_RUNTIME_SLOT_REPLICA_LIMIT
-                                  : 1U;
+    size_t vp_slot_replicas = VP_RUNTIME_SLOT_REPLICA_LIMIT;
     size_t vp_frontier_slots =
         (size_t)CMP_MAP_W * afl->value_profile_slots * vp_slot_replicas;
     afl->vp_frontier =
         ck_alloc(vp_frontier_slots * sizeof(vp_frontier_entry_t));
-    if (afl->value_profile_source == VP_SOURCE_RUNTIME_SHM) {
-
-      afl->vp_runtime_slot_mask = ck_alloc(CMP_MAP_W * sizeof(u16));
-
-    }
+    afl->vp_runtime_slot_mask = ck_alloc(CMP_MAP_W * sizeof(u16));
 
     for (size_t i = 0; i < vp_frontier_slots; ++i) {
 
@@ -2021,12 +1987,10 @@ int main(int argc, char **argv_orig, char **envp) {
 
     }
 
-    OKF("Value profiling: mode %u%s, level %u, slots %u, replicas %zu, "
-        "source=%s",
+    OKF("Value profiling: mode %u%s, slots %u, replicas %zu, source=%s",
         afl->value_profile_mode,
         afl->value_profile_mode == 1 ? " (always on)" : " (stagnation)",
-        afl->value_profile_level, afl->value_profile_slots, vp_slot_replicas,
-        afl->value_profile_level == 1 ? "runtime-shm" : "cmplog");
+        afl->value_profile_slots, vp_slot_replicas, "runtime-shm");
 
   }
 
@@ -2850,8 +2814,8 @@ int main(int argc, char **argv_orig, char **envp) {
         !(main_caps & BIN_CAP_VP_RUNTIME)) {
 
       FATAL(
-          "Value profile level 1 requires runtime VP instrumentation in "
-          "the main target. Recompile with AFL_LLVM_VALUE_PROFILE=1 (or "
+          "Value profiling requires runtime VP instrumentation in the main "
+          "target. Recompile with AFL_LLVM_VALUE_PROFILE=1 (or "
           "AFL_LLVM_VALUEPROFILE=1).");
 
     }
@@ -2975,8 +2939,8 @@ int main(int argc, char **argv_orig, char **envp) {
         !afl->fsrv.use_value_profile) {
 
       FATAL(
-          "Value profile level 1 requires target support for value "
-          "profile runtime SHM. Recompile the target with "
+          "Value profiling requires target support for value profile runtime "
+          "SHM. Recompile the target with "
           "AFL_LLVM_VALUE_PROFILE=1 (or AFL_LLVM_VALUEPROFILE=1).");
 
     }

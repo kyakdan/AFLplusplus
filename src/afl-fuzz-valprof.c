@@ -264,15 +264,17 @@ void vp_prepare_exec(afl_state_t *afl, afl_forkserver_t *fsrv) {
     if (unlikely(!fsrv->use_value_profile)) {
 
       FATAL(
-          "Value profile level 1 requires target support for value "
-          "profile runtime SHM. Recompile the target with "
+          "Value profiling requires target support for value profile runtime "
+          "SHM. Recompile the target with "
           "AFL_LLVM_VALUE_PROFILE=1 (or AFL_LLVM_VALUEPROFILE=1).");
 
     }
 
     if (unlikely(!afl->shm.vp_map)) {
 
-      FATAL("Value profile runtime map missing although level 1 was selected.");
+      FATAL(
+          "Value profile runtime map missing although value profiling was "
+          "selected.");
 
     }
 

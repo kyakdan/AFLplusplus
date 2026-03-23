@@ -324,106 +324,92 @@ test -e ../afl-clang-fast -a -e ../split-switches-pass.so && {
       CODE=1
     }
   }
-  # Test value profiling with cmplog
+  # Test runtime value profiling
  test "$SYS" = "i686" -o "$SYS" = "x86_64" -o "$SYS" = "amd64" && {
   ../afl-clang-fast -o test-value-profile test-value-profile.c > /dev/null 2>&1
-  AFL_LLVM_CMPLOG=1 ../afl-clang-fast -o test-value-profile.cmplog test-value-profile.c > /dev/null 2>&1
   AFL_LLVM_VALUE_PROFILE=1 ../afl-clang-fast -o test-value-profile.vp test-value-profile.c > /dev/null 2>&1
   AFL_LLVM_VALUE_PROFILE=1 ../afl-clang-fast -O0 -fno-inline -fno-builtin -o test-value-profile-slot-spill.vp test-value-profile-slot-spill.c > /dev/null 2>&1
-  AFL_LLVM_CMPLOG=1 AFL_LLVM_VALUE_PROFILE=1 ../afl-clang-fast -o test-value-profile.both test-value-profile.c > /dev/null 2>&1
-  test -e test-value-profile -a -e test-value-profile.cmplog -a -e test-value-profile.vp -a -e test-value-profile-slot-spill.vp -a -e test-value-profile.both && {
-    $ECHO "$GREY[*] running afl-fuzz for llvm_mode value profiling checks, this will take approx 150 seconds"
+  test -e test-value-profile -a -e test-value-profile.vp -a -e test-value-profile-slot-spill.vp && {
+    $ECHO "$GREY[*] running afl-fuzz for llvm_mode runtime value profiling checks, this will take approx 150 seconds"
     {
       ./test-value-profile-slot-spill.vp >>errors 2>&1
       mkdir -p in
       echo 00000000 > in/in
-      AFL_BENCH_UNTIL_CRASH=1 AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -m none -V20 -i in -o out_no_vp -c ./test-value-profile.cmplog -- ./test-value-profile >>errors 2>&1
-      AFL_BENCH_UNTIL_CRASH=1 AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -j2 -m none -V90 -i in -o out_vp -c ./test-value-profile.cmplog -- ./test-value-profile >>errors 2>&1
-      # Regression check: mode 2 must activate from edge-coverage stagnation.
-      timeout 120s env AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -j2 -r2 -m none -V20 -i in -o out_vp_stag -c ./test-value-profile.cmplog -- ./test-value-profile >>errors 2>&1 || true
-      # Level 2 inline source path (main target built with CmpLog)
-      AFL_BENCH_UNTIL_CRASH=1 AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -j2 -m none -V8 -i in -o out_vp_inline -- ./test-value-profile.cmplog >>errors 2>&1
-      # Level 1 runtime path (main target built with VP runtime instrumentation)
-      AFL_BENCH_UNTIL_CRASH=1 AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -j1 -m none -V8 -i in -o out_vp_l1 -- ./test-value-profile.vp >>errors 2>&1
-      # Level 1 must fail clearly when runtime VP instrumentation is missing.
-      AFL_BENCH_UNTIL_CRASH=1 AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -j1 -m none -V4 -i in -o out_l1_err -- ./test-value-profile >>errors 2>&1 || true
+      AFL_BENCH_UNTIL_CRASH=1 AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -m none -V20 -i in -o out_no_vp -- ./test-value-profile.vp >>errors 2>&1
+      AFL_BENCH_UNTIL_CRASH=1 AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -r0 -m none -V90 -i in -o out_vp -- ./test-value-profile.vp >>errors 2>&1
+      # Regression check: runtime VP must activate from edge-coverage stagnation.
+      timeout 120s env AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -r2 -m none -V20 -i in -o out_vp_stag -- ./test-value-profile.vp >>errors 2>&1 || true
+      # Runtime VP must fail clearly when runtime instrumentation is missing.
+      AFL_BENCH_UNTIL_CRASH=1 AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -r0 -m none -V4 -i in -o out_l1_err -- ./test-value-profile >>errors 2>&1 || true
       # Snapshot pre-resume VP stats now: the fastresume checks below intentionally
       # mutate out_vp/default/* and out_no_vp/default/*.
       cp out_vp/default/fuzzer_stats vp_pre_resume_fuzzer_stats
       no_vp_stats_has_vp=0
       grep -q "^value_profile_finds" out_no_vp/default/fuzzer_stats && no_vp_stats_has_vp=1 || true
       # Fastresume VP compatibility checks:
-      # 1) resume VP fastresume without -j
-      AFL_AUTORESUME=1 AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -m none -V2 -i in -o out_vp -c ./test-value-profile.cmplog -- ./test-value-profile >vp_resume_no_vp.log 2>&1
-      # 2) resume non-VP fastresume with -j2
-      AFL_AUTORESUME=1 AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -j2 -m none -V2 -i in -o out_no_vp -c ./test-value-profile.cmplog -- ./test-value-profile >vp_resume_with_vp.log 2>&1
+      # 1) resume a VP run without -r
+      AFL_AUTORESUME=1 AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -m none -V2 -i in -o out_vp -- ./test-value-profile.vp >vp_resume_no_vp.log 2>&1
+      # 2) resume a non-VP run with runtime VP enabled
+      AFL_AUTORESUME=1 AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -r0 -m none -V2 -i in -o out_no_vp -- ./test-value-profile.vp >vp_resume_with_vp.log 2>&1
       cat vp_resume_no_vp.log vp_resume_with_vp.log >>errors
     } >>errors 2>&1
 
     vp_finds="$(awk -F: '/^value_profile_finds/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' vp_pre_resume_fuzzer_stats)"
     vp_stag_finds="$(awk -F: '/^value_profile_finds/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' out_vp_stag/default/fuzzer_stats)"
-    vp_inline_finds="$(awk -F: '/^value_profile_finds/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' out_vp_inline/default/fuzzer_stats)"
-    vp_l1_finds="$(awk -F: '/^value_profile_finds/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' out_vp_l1/default/fuzzer_stats)"
     test -n "$vp_finds" &&
     test "$vp_finds" -gt 0 &&
     test -n "$vp_stag_finds" &&
     test "$vp_stag_finds" -gt 0 &&
-    test -n "$vp_inline_finds" &&
-    test "$vp_inline_finds" -gt 0 &&
-    test -n "$vp_l1_finds" &&
-    test "$vp_l1_finds" -gt 0 &&
     grep -q "Stagnation (" errors &&
-    grep -q "Value profile level 1 requires runtime VP instrumentation" errors &&
+    grep -q "Value profiling requires runtime VP instrumentation" errors &&
     grep -q "Will perform FAST RESUME" vp_resume_no_vp.log &&
     grep -q "Will perform FAST RESUME" vp_resume_with_vp.log &&
     ! grep -q "Segmentation fault" vp_resume_no_vp.log &&
     ! grep -q "Segmentation fault" vp_resume_with_vp.log &&
     test "$no_vp_stats_has_vp" -eq 0 &&
-    strings -a test-value-profile.both | grep -q "__AFL_CMPLOG_INSTRUMENTED" &&
-    strings -a test-value-profile.both | grep -q "__AFL_VP_RUNTIME_INSTRUMENTED" &&
+    strings -a test-value-profile.vp | grep -q "__AFL_VP_RUNTIME_INSTRUMENTED" &&
     ! grep -q "Segmentation fault" errors && {
-      $ECHO "$GREEN[+] afl-fuzz is working correctly with llvm_mode value profiling"
+      $ECHO "$GREEN[+] afl-fuzz is working correctly with llvm_mode runtime value profiling"
     } || {
       echo CUT------------------------------------------------------------------CUT
       cat errors
       echo CUT------------------------------------------------------------------CUT
-      $ECHO "$RED[!] afl-fuzz is not working correctly with llvm_mode value profiling"
+      $ECHO "$RED[!] afl-fuzz is not working correctly with llvm_mode runtime value profiling"
       CODE=1
     }
   } || {
-    $ECHO "$YELLOW[-] we cannot test llvm_mode value profiling because compilation failed"
+    $ECHO "$YELLOW[-] we cannot test llvm_mode runtime value profiling because compilation failed"
     INCOMPLETE=1
   }
   cc -O2 -fPIC -shared -I../include -o test-vp-postprocess-mutator.so test-vp-postprocess-mutator.c > /dev/null 2>&1
-  ../afl-clang-fast -DVP_LOG_PATH='"/tmp/afl-vp-main.log"' -o test-vp-postprocess test-vp-postprocess-target.c > /dev/null 2>&1
-  AFL_LLVM_CMPLOG=1 ../afl-clang-fast -DVP_LOG_PATH='"/tmp/afl-vp-cmplog.log"' -o test-vp-postprocess.cmplog test-vp-postprocess-target.c > /dev/null 2>&1
-  test -e test-vp-postprocess-mutator.so -a -e test-vp-postprocess -a -e test-vp-postprocess.cmplog && {
+  AFL_LLVM_VALUE_PROFILE=1 ../afl-clang-fast -DVP_LOG_PATH='"/tmp/afl-vp-main.log"' -o test-vp-postprocess test-vp-postprocess-target.c > /dev/null 2>&1
+  test -e test-vp-postprocess-mutator.so -a -e test-vp-postprocess && {
     $ECHO "$GREY[*] running VP post_process regression check"
     {
-      rm -f /tmp/afl-vp-main.log /tmp/afl-vp-cmplog.log
+      rm -f /tmp/afl-vp-main.log
       mkdir -p in_post
       echo 0000000000 > in_post/in
-      AFL_POST_PROCESS_KEEP_ORIGINAL=1 AFL_CUSTOM_MUTATOR_LIBRARY=./test-vp-postprocess-mutator.so AFL_BENCH_UNTIL_CRASH=1 AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -j2 -m none -V10 -i in_post -o out_vp_post -c ./test-vp-postprocess.cmplog -- ./test-vp-postprocess >>errors_post 2>&1
+      AFL_POST_PROCESS_KEEP_ORIGINAL=1 AFL_CUSTOM_MUTATOR_LIBRARY=./test-vp-postprocess-mutator.so AFL_BENCH_UNTIL_CRASH=1 AFL_NO_CRASH_README=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 ../afl-fuzz -r0 -m none -V10 -i in_post -o out_vp_post -- ./test-vp-postprocess >>errors_post 2>&1
     } >>errors_post 2>&1
-    if test -f /tmp/afl-vp-cmplog.log; then
-      vp_cmplog_total="$(wc -l < /tmp/afl-vp-cmplog.log)"
-      vp_non_magic="$(awk '$2 != "4d41474943" {c++} END {print c+0}' /tmp/afl-vp-cmplog.log)"
+    if test -f /tmp/afl-vp-main.log; then
+      vp_main_total="$(wc -l < /tmp/afl-vp-main.log)"
+      vp_non_magic="$(awk '$2 != "4d41474943" {c++} END {print c+0}' /tmp/afl-vp-main.log)"
     else
-      vp_cmplog_total=0
+      vp_main_total=0
       vp_non_magic=1
     fi
-    test -n "$vp_cmplog_total" &&
-    test "$vp_cmplog_total" -gt 0 &&
+    test -n "$vp_main_total" &&
+    test "$vp_main_total" -gt 0 &&
     test "$vp_non_magic" -eq 0 && {
       $ECHO "$GREEN[+] VP post_process regression check passed"
     } || {
       echo CUT------------------------------------------------------------------CUT
       cat errors_post
       echo CUT------------------------------------------------------------------CUT
-      if test -f /tmp/afl-vp-cmplog.log; then
-        echo VP-CMPLOG------------------------------------------------------------
-        awk '$2 != "4d41474943" {print; if(++n==20) exit}' /tmp/afl-vp-cmplog.log
-        echo VP-CMPLOG------------------------------------------------------------
+      if test -f /tmp/afl-vp-main.log; then
+        echo VP-MAIN--------------------------------------------------------------
+        awk '$2 != "4d41474943" {print; if(++n==20) exit}' /tmp/afl-vp-main.log
+        echo VP-MAIN--------------------------------------------------------------
       fi
       $ECHO "$RED[!] VP post_process regression check failed"
       CODE=1
@@ -432,9 +418,9 @@ test -e ../afl-clang-fast -a -e ../split-switches-pass.so && {
     $ECHO "$YELLOW[-] we cannot run VP post_process regression check because compilation failed"
     INCOMPLETE=1
   }
-  rm -rf errors errors_post vp_resume_no_vp.log vp_resume_with_vp.log vp_pre_resume_fuzzer_stats test-value-profile test-value-profile.cmplog test-value-profile.vp test-value-profile-slot-spill.vp test-value-profile.both test-vp-postprocess test-vp-postprocess.cmplog test-vp-postprocess-mutator.so in in_post out_no_vp out_vp out_vp_stag out_vp_inline out_vp_l1 out_l1_err out_vp_post core.* /tmp/afl-vp-main.log /tmp/afl-vp-cmplog.log
+  rm -rf errors errors_post vp_resume_no_vp.log vp_resume_with_vp.log vp_pre_resume_fuzzer_stats test-value-profile test-value-profile.vp test-value-profile-slot-spill.vp test-vp-postprocess test-vp-postprocess-mutator.so in in_post out_no_vp out_vp out_vp_stag out_l1_err out_vp_post core.* /tmp/afl-vp-main.log
  } || {
-  $ECHO "$YELLOW[-] value profiling requires CmpLog, too slow to test in ARM CI"
+  $ECHO "$YELLOW[-] runtime value profiling checks are only run on x86/x64 CI"
   INCOMPLETE=1
  }
   ../afl-clang-fast -o test-persistent ../utils/persistent_mode/persistent_demo.c > /dev/null 2>&1

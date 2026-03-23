@@ -1,7 +1,7 @@
 /*
-  Simple custom mutator used by the value-profile regression test.
-  post_process always prepends "MAGIC" so we can detect if a CmpLog run
-  bypasses write_to_testcase() and sees the unprocessed buffer.
+  Simple custom mutator used by the runtime value-profile regression test.
+  post_process always prepends "MAGIC" so we can detect if VP-guided
+  executions see the processed buffer.
  */
 
 #include "afl-fuzz.h"

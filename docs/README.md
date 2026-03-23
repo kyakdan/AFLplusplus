@@ -60,7 +60,7 @@ To learn about fuzzing other targets, see:
 
 ## Additional information
 
-* Value profiling and level-1 VP taint:
+* Value profiling and runtime VP taint:
   [value_profiling.md](value_profiling.md)
 * Tools that help fuzzing with AFL++:
   [third_party_tools.md](third_party_tools.md)
