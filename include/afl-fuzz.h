@@ -980,6 +980,9 @@ typedef struct afl_state {
 
   u8 *out_scratch_buf;
 
+  u32 *vp_taint_active_idx_buf;
+  u32  vp_taint_active_idx_cap;
+
   u8 *eff_buf;
 
   u8 *in_buf;

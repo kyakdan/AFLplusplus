@@ -476,45 +476,89 @@ static void vp_maybe_analyze_taint(afl_state_t *afl, struct queue_entry *q,
 
 }
 
+static inline void vp_ensure_active_taint_idx_cap(afl_state_t *afl, u32 need) {
+
+  if (!afl || afl->vp_taint_active_idx_cap >= need) return;
+
+  afl->vp_taint_active_idx_buf =
+      ck_realloc(afl->vp_taint_active_idx_buf,
+                 need * sizeof(*afl->vp_taint_active_idx_buf));
+  afl->vp_taint_active_idx_cap = need;
+
+}
+
+static u32 vp_collect_owned_sensitive_taint_indices(const struct queue_entry *q,
+                                                    u32 *out_indices) {
+
+  if (!q || !q->vp_taint || !q->vp_owned_site_cnt || !out_indices) return 0;
+
+  u32 owned_idx = 0;
+  u32 out_cnt = 0;
+  for (u32 i = 0; i < q->vp_taint_cnt && owned_idx < q->vp_owned_site_cnt;
+       ++i) {
+
+    const vp_taint_site_t *site = &q->vp_taint[i];
+    if (!site->sensitive_cnt) continue;
+
+    while (owned_idx < q->vp_owned_site_cnt &&
+           q->vp_owned_sites[owned_idx] < site->site_id) {
+
+      ++owned_idx;
+
+    }
+
+    if (owned_idx < q->vp_owned_site_cnt &&
+        q->vp_owned_sites[owned_idx] == site->site_id) {
+
+      out_indices[out_cnt++] = i;
+
+    }
+
+  }
+
+  return out_cnt;
+
+}
+
+static u32 vp_collect_all_sensitive_taint_indices(const struct queue_entry *q,
+                                                  u32 *out_indices) {
+
+  if (!q || !q->vp_taint || !out_indices) return 0;
+
+  u32 out_cnt = 0;
+  for (u32 i = 0; i < q->vp_taint_cnt; ++i) {
+
+    if (!q->vp_taint[i].sensitive_cnt) continue;
+    out_indices[out_cnt++] = i;
+
+  }
+
+  return out_cnt;
+
+}
+
 static void vp_prepare_active_taint_sites(afl_state_t        *afl,
                                           struct queue_entry *q,
-                                          u8                  splice_cycle,
-                                          vp_taint_site_t  ***out_sites,
-                                          u32                *out_cnt) {
+                                          u8 splice_cycle, u32 **out_indices,
+                                          u32 *out_cnt) {
 
-  *out_sites = NULL;
+  *out_indices = NULL;
   *out_cnt = 0;
 
   if (!q || !q->vp_ref_cnt) return;
 
   vp_maybe_analyze_taint(afl, q, splice_cycle);
 
-  if (!vp_taint_ready(q) || !q->vp_taint) return;
+  if (!vp_taint_ready(q) || !q->vp_taint || !q->vp_taint_cnt) return;
 
-  u8 have_owned = 0;
-  *out_sites = ck_alloc(q->vp_taint_cnt * sizeof(**out_sites));
-  for (u32 i = 0; i < q->vp_taint_cnt; ++i) {
+  vp_ensure_active_taint_idx_cap(afl, q->vp_taint_cnt);
+  *out_indices = afl->vp_taint_active_idx_buf;
 
-    vp_taint_site_t *node = &q->vp_taint[i];
-    if (node->sensitive_cnt > 0 && vp_taint_site_owned(afl, node->site_id, q)) {
+  *out_cnt = vp_collect_owned_sensitive_taint_indices(q, *out_indices);
+  if (*out_cnt) return;
 
-      (*out_sites)[(*out_cnt)++] = node;
-      have_owned = 1;
-
-    }
-
-  }
-
-  if (have_owned) return;
-
-  *out_cnt = 0;
-  for (u32 i = 0; i < q->vp_taint_cnt; ++i) {
-
-    vp_taint_site_t *node = &q->vp_taint[i];
-    if (!node->sensitive_cnt) continue;
-    (*out_sites)[(*out_cnt)++] = node;
-
-  }
+  *out_cnt = vp_collect_all_sensitive_taint_indices(q, *out_indices);
+  if (!*out_cnt) *out_indices = NULL;
 
 }
 
@@ -579,11 +623,11 @@ u8 fuzz_one_original(afl_state_t *afl) {
 
   u8 ret_val = 1, doing_det = 0;
 
-  u8                a_collect[MAX_AUTO_EXTRA];
-  u32               a_len = 0;
-  vp_taint_site_t **vp_taint_active_sites = NULL;
-  u32               vp_taint_active_cnt = 0;
-  u8               *vp_det_skip_eff_map = NULL;
+  u8   a_collect[MAX_AUTO_EXTRA];
+  u32  a_len = 0;
+  u32 *vp_taint_active_indices = NULL;
+  u32  vp_taint_active_cnt = 0;
+  u8  *vp_det_skip_eff_map = NULL;
 
   /* IJON: If we're doing IJON, skip deterministic stages and go directly to
    * havoc */
@@ -2471,15 +2515,8 @@ havoc_stage:
   /* VP taint: prepare active sites for this entry before havoc. */
   vp_taint_site_t *vp_active_site = NULL;
 
-  if (vp_taint_active_sites) {
-
-    ck_free(vp_taint_active_sites);
-    vp_taint_active_sites = NULL;
-
-  }
-
   vp_prepare_active_taint_sites(afl, afl->queue_cur, splice_cycle,
-                                &vp_taint_active_sites, &vp_taint_active_cnt);
+                                &vp_taint_active_indices, &vp_taint_active_cnt);
 
   /* We essentially just do several thousand runs (depending on perf_score)
      where we take the input file and make random stacked tweaks. */
@@ -2575,7 +2612,8 @@ havoc_stage:
     if (vp_taint_active_cnt > 0) {
 
       vp_active_site =
-          vp_taint_active_sites[rand_below(afl, vp_taint_active_cnt)];
+          &afl->queue_cur->vp_taint[vp_taint_active_indices[rand_below(
+              afl, vp_taint_active_cnt)]];
 
     }
 
@@ -4005,13 +4043,6 @@ abandon_entry:
 
   }
 
-  if (vp_taint_active_sites) {
-
-    ck_free(vp_taint_active_sites);
-    vp_taint_active_sites = NULL;
-
-  }
-
   /* IJON queue protection only - memory cleanup handled normally */
   if (unlikely(afl->is_doing_ijon)) {
 
@@ -4073,11 +4104,11 @@ static u8 mopt_common_fuzzing(afl_state_t *afl, MOpt_globals_t MOpt_globals) {
 
   u8 ret_val = 1, doing_det = 0;
 
-  u8                a_collect[MAX_AUTO_EXTRA];
-  u32               a_len = 0;
-  vp_taint_site_t **vp_taint_active_sites = NULL;
-  u32               vp_taint_active_cnt = 0;
-  vp_taint_site_t  *vp_active_site = NULL;
+  u8               a_collect[MAX_AUTO_EXTRA];
+  u32              a_len = 0;
+  u32             *vp_taint_active_indices = NULL;
+  u32              vp_taint_active_cnt = 0;
+  vp_taint_site_t *vp_active_site = NULL;
 
 #ifdef IGNORE_FINDS
 
@@ -5670,15 +5701,8 @@ pacemaker_fuzzing:
 
       }
 
-      if (vp_taint_active_sites) {
-
-        ck_free(vp_taint_active_sites);
-        vp_taint_active_sites = NULL;
-
-      }
-
       vp_prepare_active_taint_sites(afl, afl->queue_cur, splice_cycle,
-                                    &vp_taint_active_sites,
+                                    &vp_taint_active_indices,
                                     &vp_taint_active_cnt);
 
       for (afl->stage_cur = 0; afl->stage_cur < afl->stage_max;
@@ -5690,7 +5714,8 @@ pacemaker_fuzzing:
         if (vp_taint_active_cnt > 0) {
 
           vp_active_site =
-              vp_taint_active_sites[rand_below(afl, vp_taint_active_cnt)];
+              &afl->queue_cur->vp_taint[vp_taint_active_indices[rand_below(
+                  afl, vp_taint_active_cnt)]];
 
         }
 
@@ -6681,13 +6706,6 @@ pacemaker_fuzzing:
     }                                                              /* block */
 
   }                                                                /* block */
-
-  if (vp_taint_active_sites) {
-
-    ck_free(vp_taint_active_sites);
-    vp_taint_active_sites = NULL;
-
-  }
 
   ++afl->queue_cur->fuzz_level;
   return ret_val;
